@@ -112,3 +112,49 @@ last, ?, bid, ask, high, low, time, prev_close, open, ..., volume(13)
 - 外盘分钟线仅当日，跨日需依赖日线
 - 环境无 sklearn / lightgbm，模型用 numpy 手写岭回归
 - 预测在弱优势时输出「震荡」，方向准确率受限于分钟级噪声
+
+## 九、APK 设计方案
+
+### 形态
+
+WebView 壳，加载局域网内后端的地址。APK 不含数据、不含前端资源，体积约 2.3 MB。
+
+不内嵌前端的原因：前端依赖 WebSocket 实时推送与 `/api/*` 接口，内嵌静态资源后仍需后端，不如直接加载后端页面，改前端免重打包。
+
+### 服务器地址配置
+
+- 首次启动若未配置地址，弹出对话框要求填写，取消则退出
+- 地址持久化到 `SharedPreferences`
+- 右下角半透明齿轮可随时修改
+- 地址必须以 `http://` 或 `https://` 开头，校验失败重新弹窗
+
+### 连接失败处理
+
+`onReceivedError` 主框架加载失败时注入错误页，提供「修改服务器地址」与「重试」两个按钮，通过 `FuturesNative` JS 接口调用原生方法。
+
+### 版本检查
+
+APK 启动后异步拉取 `https://raw.githubusercontent.com/zpj100/futures-forecast/main/release/version.json`：
+
+1. 解析 `versionCode`，与本机 `BuildConfig.VERSION_CODE` 比较
+2. 远端更大时弹窗展示 `notes`，点击跳转 `url`
+3. 网络失败静默忽略，不打扰使用
+
+### 外部链接
+
+`shouldOverrideUrlLoading` 拦截非服务器域名的链接，用系统浏览器打开，避免在 WebView 内迷失。
+
+### 返回键
+
+WebView 可后退时优先后退；已在首页时 2 秒内再按一次才退出。
+
+### 构建
+
+- AGP 8.2.2 + Gradle 8.2.1 + JDK 17 + compileSdk 34
+- 签名密钥 `android/app/keystore.jks`（RSA 2048，10 年有效期）
+- `bash android/build-apk.sh` 一键构建，产物放 `releases/`
+
+### 已知限制
+
+- 局域网地址变化后需手动改；后续可加 mDNS 自动发现
+- Android 9+ 默认禁止明文 HTTP，本项目通过 `usesCleartextTraffic="true"` 放开（仅用于局域网场景）

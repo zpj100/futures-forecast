@@ -1,0 +1,41 @@
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'com.zpj.futures'
+    compileSdk 34
+    defaultConfig {
+        applicationId 'com.zpj.futures'
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName '1.0.0'
+    }
+    signingConfigs {
+        release {
+            storeFile file('keystore.jks')
+            storePassword 'futures2026'
+            keyAlias 'futures'
+            keyPassword 'futures2026'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.release
+        }
+        debug {
+            signingConfig signingConfigs.release
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    buildFeatures {
+        buildConfig true
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+}

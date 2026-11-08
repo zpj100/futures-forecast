@@ -99,22 +99,45 @@ futures-forecast/
 └── README.md
 ```
 
-## 七、自动更新（为后续 APK 预留）
+## 七、Android APK
 
-`release/version.json` 是给客户端读取的版本清单，随仓库与 Release 一起发布：
+APK 是一个 WebView 壳，加载局域网内的后端地址，本身不含数据。
+
+```bash
+# 构建（首次需联网下载 Gradle 依赖，之后可离线）
+bash android/build-apk.sh
+```
+
+产物：`releases/futures-forecast-v1.0.0.apk`（约 2.3 MB，已签名）
+
+使用步骤：
+
+1. 电脑上 `bash run.sh` 启动后端，记下电脑局域网 IP（如 `192.168.1.10`）
+2. 手机安装 APK，首次打开会弹出「服务器地址」对话框
+3. 填 `http://192.168.1.10:8000`，保存即可
+4. 之后点击右下角齿轮可随时修改地址
+
+手机与电脑需在同一局域网。服务用 HTTPS 暴露到公网时也可直接填公网地址。
+
+## 八、自动更新
+
+`release/version.json` 是客户端读取的版本清单：
 
 ```json
 {
   "version": "1.0.0",
   "versionCode": 1,
   "url": "https://github.com/zpj100/futures-forecast/releases/latest",
-  "notes": "首个版本"
+  "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
+  "notes": "首个版本：三品种实时行情、六周期趋势预测、量化指标、资讯聚合与 Web 仪表盘。"
 }
 ```
 
-客户端检查 `versionCode` 大于本地值即提示更新，下载地址从 Release 资产获取。
-仓库同时镜像到 Gitee，主地址不可达时可回落。
+APK 启动后拉取 GitHub 上的 `release/version.json`，`versionCode` 大于本地值时弹窗提示更新，点击跳转 Release 页。
+仓库同时镜像到 Gitee，GitHub 不可达时可手动从 Gitee 下载。
 
-## 八、免责声明
+发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName` → 构建 → 同步更新 `release/version.json` → 打 GitHub Release 并上传 APK。
+
+## 九、免责声明
 
 本项目为量化统计研究与可视化演示，所有预测与建议均不构成投资建议。期货交易有杠杆风险，请自行判断并控制仓位。
