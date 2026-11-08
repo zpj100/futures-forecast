@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>铝期货趋势预测 · 电解铝 / 氧化铝 / 伦铝</title>
+<meta name="theme-color" content="#06080d">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<a class="skip" href="#main">跳到主要内容</a>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 17l5-6 4 3 4-7 5 5" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M3 21h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    </svg>
+    <div>
+      <h1>铝期货趋势预测</h1>
+      <p class="sub">电解铝 · 氧化铝 · 伦铝　六周期量化预测</p>
+    </div>
+  </div>
+  <div class="status" role="status" aria-live="polite">
+    <span id="connDot" class="dot offline"></span>
+    <span id="connText">连接中…</span>
+    <span id="clock" class="clock">--:--:--</span>
+  </div>
+</header>
+
+<main id="main">
+
+  <section class="cards" id="quoteCards" aria-label="品种实时行情">
+  </section>
+
+  <section class="panel chart-panel">
+    <div class="panel-head">
+      <div class="tabs" id="prodTabs" role="tablist" aria-label="品种切换"></div>
+      <div class="seg" id="periodSeg" role="group" aria-label="K线周期">
+        <button data-period="1m" class="on">1分</button>
+        <button data-period="5m">5分</button>
+        <button data-period="15m">15分</button>
+        <button data-period="60m">1时</button>
+        <button data-period="1d">日线</button>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="mainChart" role="img" aria-label="价格走势图"></canvas>
+      <div id="chartTip" class="chart-tip" hidden></div>
+    </div>
+    <div class="chart-foot">
+      <span id="chartRange" class="muted">—</span>
+      <span id="chartLegend" class="legend"></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>趋势预测 <span class="muted sm">六周期 · 走向外验证</span></h2>
+      <div class="seg" id="fcProdSeg" role="group" aria-label="预测品种"></div>
+    </div>
+    <div class="horizons" id="horizons"></div>
+  </section>
+
+  <div class="duo">
+    <section class="panel">
+      <div class="panel-head"><h2>量化指标</h2></div>
+      <div class="ind-grid" id="indicators"></div>
+      <div class="rec" id="recommendation"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>资讯</h2>
+        <div class="seg" id="newsSeg" role="group" aria-label="资讯筛选">
+          <button data-code="" class="on">全部</button>
+          <button data-code="AL">电解铝</button>
+          <button data-code="AO">氧化铝</button>
+          <button data-code="AHD">伦铝</button>
+        </div>
+      </div>
+      <div class="news" id="news"></div>
+    </section>
+  </div>
+
+  <section class="panel data-panel">
+    <div class="panel-head"><h2>数据说明</h2></div>
+    <div class="data-grid" id="dataMeta"></div>
+    <p class="muted sm note">
+      公开接口能提供的最细历史粒度为 1 分钟（沪铝/氧化铝约 3 个交易日，伦铝当日）。
+      服务启动后每 3 秒抓取一次实时快照并本地累积，秒级历史随运行时长增长；
+      日线历史可回溯多年，用于 8 小时与 1 天周期的建模。
+    </p>
+  </section>
+
+</main>
+
+<footer class="foot">
+  <span>数据来源：新浪财经公开行情 · 东方财富 / 同花顺公开资讯</span>
+  <span class="muted">量化统计结果，不构成投资建议</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

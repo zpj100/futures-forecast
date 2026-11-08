@@ -1,0 +1,7 @@
+{
+  "version": "1.0.0",
+  "versionCode": 1,
+  "url": "https://github.com/zpj100/futures-forecast/releases/latest",
+  "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
+  "notes": "首个版本：三品种实时行情、六周期趋势预测、量化指标、资讯聚合与 Web 仪表盘。"
+}
