@@ -17,10 +17,16 @@
     histCode: '',
     settings: {},
     update: null,
-    llmBusy: false
+    llmBusy: false,
+    compare: false,   // 三品种叠加（涨跌幅归一化）
+    hidden: {},       // 对比模式下被隐藏的序列
+    chart: null,      // 当前图表几何，供十字星重绘
+    crossTimer: 0
   };
 
   var PERIODS = [
+    { k: '1s', label: '1秒', tick: 0 },
+    { k: '30s', label: '30秒', tick: 30 },
     { k: '1m', label: '1分', step: 1 },
     { k: '5m', label: '5分', step: 5 },
     { k: '15m', label: '15分', step: 15 },
@@ -217,153 +223,432 @@
     ctx.stroke();
   }
 
-  function renderChart() {
-    var canvas = $('#chart');
-    var empty = $('#chartEmpty');
-    var period = PERIODS.filter(function (p) { return p.k === S.period; })[0] || PERIODS[0];
-    var raw = null;
-    var bars = [];
-    try {
-      raw = JSON.parse(DEMO
-        ? JSON.stringify(demoBars(S.code, period.step))
-        : N.kline(S.code, period.k, period.k === '1d' ? 4000 : 1400));
-      bars = (raw && raw.bars) || [];
-    } catch (e) { bars = []; }
+  var SERIES_COLORS = { AL: '#4EA8FF', AO: '#FFA63D', AHD: '#B07BFF' };
+  var COMPARE_CODES = ['AL', 'AO', 'AHD'];
 
-    // 该周期没有独立数据时，用 1 分钟线现场聚合兜底
-    if (bars.length < 2 && !DEMO && period.step > 1) {
-      try {
-        var one = JSON.parse(N.kline(S.code, '1m', 1400));
-        bars = aggregate((one && one.bars) || [], period.step);
-      } catch (e) { bars = []; }
-    }
-
-    var limit = (period.k === '60m' || period.k === '1d') ? 1100 : 260;
-    bars = bars.slice(-limit);
-
-    var meta = $('#chartMeta');
-    if (meta) {
-      if (!bars.length) meta.textContent = '—';
-      else {
-        var span = Math.round((bars[bars.length - 1][0] - bars[0][0]) / 86400000);
-        meta.textContent = bars.length + ' 根 · ' + period.label
-          + ' · ' + dateStr(bars[0][0]) + (span > 0 ? '（' + span + ' 天）' : '');
-      }
-    }
-    if (bars.length < 2) {
-      empty.style.display = 'grid';
-      var ctx0 = canvas.getContext('2d');
-      ctx0.clearRect(0, 0, canvas.width, canvas.height);
-      return;
-    }
-    empty.style.display = 'none';
-    drawLine(canvas, bars);
-  }
-
-  function aggregate(bars, step) {
-    if (!step || step <= 1) return bars;
-    var out = [], cur = null;
-    for (var i = 0; i < bars.length; i++) {
-      var b = bars[i];
-      if (!cur) cur = { ts: b[0], o: b[1], h: b[2], l: b[3], c: b[4], v: b[5], n: 1 };
-      else {
-        cur.h = Math.max(cur.h, b[2]);
-        cur.l = Math.min(cur.l, b[3]);
-        cur.c = b[4];
-        cur.v += b[5];
-        cur.ts = b[0];
-        cur.n++;
-      }
-      if (cur.n >= step) { out.push([cur.ts, cur.o, cur.h, cur.l, cur.c, cur.v]); cur = null; }
-    }
-    if (cur) out.push([cur.ts, cur.o, cur.h, cur.l, cur.c, cur.v]);
+  function periodByKey(k) {
+    var out = PERIODS[0];
+    PERIODS.forEach(function (p) { if (p.k === k) out = p; });
     return out;
   }
 
-  function drawLine(canvas, bars) {
+  function isTick(period) { return period.tick !== undefined; }
+
+  /** 取某品种某周期的序列，统一成 [ts,o,h,l,c,v] 数组。 */
+  function loadBars(code, period) {
+    var out = [];
+    if (DEMO) return demoSeries(code, period);
+    try {
+      if (isTick(period)) {
+        var tr = JSON.parse(N.tickSeries(code, period.tick, 600));
+        (tr && tr.points || []).forEach(function (p) {
+          out.push([p[0], p[1], p[2], p[3], p[4], p[5]]);
+        });
+        return out;
+      }
+      var raw = JSON.parse(DEMO ? '{"bars":[]}'
+        : N.kline(code, period.k, period.k === '1d' ? 4000 : 1400));
+      (raw && raw.bars || []).forEach(function (b) {
+        out.push([b[0], b[1], b[2], b[3], b[4], b[5]]);
+      });
+      if (out.length < 2 && period.step > 1) {
+        var one = JSON.parse(N.kline(code, '1m', 1400));
+        out = aggregate((one && one.bars || []), period.step);
+      }
+    } catch (e) { out = []; }
+    return out;
+  }
+
+  function renderChart() {
+    var canvas = $('#chart');
+    var empty = $('#chartEmpty');
+    var period = periodByKey(S.period);
+    var compare = !!S.compare;
+
+    var list = compare ? COMPARE_CODES : [S.code];
+    var series = [];
+    list.forEach(function (code) {
+      var bars = loadBars(code, period);
+      var limit = (period.k === '60m' || period.k === '1d') ? 1100
+        : isTick(period) ? 600 : 260;
+      bars = bars.slice(-limit);
+      var prod = findProduct(code);
+      // 单品种沿用「红涨绿跌」；对比模式用品种固定色区分
+      var trendUp = bars.length > 1 && bars[bars.length - 1][4] >= bars[0][4];
+      series.push({
+        code: code,
+        label: (prod && prod.short) || code,
+        color: compare ? (SERIES_COLORS[code] || '#4EA8FF')
+          : (trendUp ? upColor() : downColor()),
+        bars: bars,
+        hidden: !!S.hidden[code]
+      });
+    });
+
+    // 单品种模式只保留一条
+    var visible = series.filter(function (s) { return !s.hidden && s.bars.length >= 2; });
+    var meta = $('#chartMeta');
+    if (!visible.length) {
+      if (meta) meta.textContent = isTick(period)
+        ? '本机暂未采集到秒级点（打开应用后自动累积）'
+        : '—';
+      empty.style.display = 'grid';
+      if (empty) empty.innerHTML = isTick(period)
+        ? '还没有秒级数据<br><span class="muted" style="font-size:11px">秒级点由本机运行累积，公开接口无历史</span>'
+        : '等待数据…<br><span class="muted" style="font-size:11px">本地无该周期K线，正在自动同步</span>';
+      var c0 = canvas.getContext('2d');
+      c0.setTransform(1, 0, 0, 1, 0, 0);
+      c0.clearRect(0, 0, canvas.width, canvas.height);
+      S.chart = null;
+      renderLegend(series, period, compare);
+      return;
+    }
+    empty.style.display = 'none';
+
+    if (meta) {
+      var total = visible.reduce(function (a, s) { return Math.max(a, s.bars.length); }, 0);
+      var t0 = Math.min.apply(null, visible.map(function (s) { return s.bars[0][0]; }));
+      var t1 = Math.max.apply(null, visible.map(function (s) {
+        return s.bars[s.bars.length - 1][0];
+      }));
+      var days = Math.round((t1 - t0) / 86400000);
+      meta.textContent = (period.label || period.k) + ' · ' + total + ' 点'
+        + (compare ? ' · 涨跌幅对比' : '') + ' · ' + dateStr(t0)
+        + (days > 0 ? '（' + days + ' 天）' : '');
+      if (isTick(period)) {
+        meta.textContent += ' · 采集点';
+      }
+    }
+
+    var geo = buildGeo(canvas, series, compare, period);
+    S.chart = geo;
+    paint(null);
+    renderLegend(series, period, compare);
+  }
+
+  function buildGeo(canvas, series, compare, period) {
     var w = canvas.clientWidth || 320;
-    var h = canvas.clientHeight || 178;
-    var light = isLight();
+    var h = canvas.clientHeight || 196;
     var dpr = window.devicePixelRatio || 1;
     canvas.width = w * dpr;
     canvas.height = h * dpr;
-    var ctx = canvas.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var padL = 6, padR = 58, padT = 14, padB = 22;
+    var t0 = Infinity, t1 = -Infinity;
+    var vMin = Infinity, vMax = -Infinity;
+    var items = [];
+    series.forEach(function (s) {
+      if (s.hidden || s.bars.length < 2) return;
+      var base = s.bars[0][4];
+      var pts = s.bars.map(function (b) {
+        var v = compare ? (base > 0 ? (b[4] - base) / base * 100 : 0) : b[4];
+        t0 = Math.min(t0, b[0]);
+        t1 = Math.max(t1, b[0]);
+        vMin = Math.min(vMin, v);
+        vMax = Math.max(vMax, v);
+        return [b[0], v, b];
+      });
+      // 点数过多时抽样，保证滚动顺畅（十字星吸附仍按抽样点）
+      if (pts.length > 900) {
+        var step = Math.ceil(pts.length / 900), sampled = [];
+        for (var i = 0; i < pts.length; i += step) sampled.push(pts[i]);
+        if (sampled[sampled.length - 1] !== pts[pts.length - 1]) sampled.push(pts[pts.length - 1]);
+        pts = sampled;
+      }
+      items.push({ code: s.code, label: s.label, color: s.color, pts: pts, bars: s.bars });
+    });
+    if (!isFinite(t0) || t1 <= t0) { t1 = t0 + 1; }
+    if (!isFinite(vMin) || vMax <= vMin) {
+      vMin = vMin - 1; vMax = vMax + 1;
+    }
+    if (compare) {
+      var lo = Math.min(vMin, 0), hi = Math.max(vMax, 0);
+      vMin = lo; vMax = hi;
+    }
+    var span = vMax - vMin || Math.max(Math.abs(vMax) * 0.002, 0.01);
+    vMin -= span * 0.14; vMax += span * 0.14;
+    return {
+      canvas: canvas, w: w, h: h, dpr: dpr, items: items, compare: compare,
+      period: period, t0: t0, t1: t1, vMin: vMin, vMax: vMax,
+      padL: padL, padR: padR, padT: padT, padB: padB
+    };
+  }
+
+  function Xof(g, ts) {
+    return g.padL + (ts - g.t0) / (g.t1 - g.t0) * (g.w - g.padL - g.padR);
+  }
+
+  function Yof(g, v) {
+    return g.padT + (1 - (v - g.vMin) / (g.vMax - g.vMin)) * (g.h - g.padT - g.padB);
+  }
+
+  function Xinv(g, x) {
+    var r = (x - g.padL) / Math.max(1, (g.w - g.padL - g.padR));
+    return g.t0 + Math.max(0, Math.min(1, r)) * (g.t1 - g.t0);
+  }
+
+  function Yinv(g, y) {
+    var r = 1 - (y - g.padT) / Math.max(1, (g.h - g.padT - g.padB));
+    return g.vMin + Math.max(0, Math.min(1, r)) * (g.vMax - g.vMin);
+  }
+
+  function paint(cross) {
+    var g = S.chart;
+    if (!g) return;
+    var ctx = g.canvas.getContext('2d');
+    var light = isLight();
+    var w = g.w, h = g.h;
+    ctx.setTransform(g.dpr, 0, 0, g.dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
-    var padL = 6, padR = 52, padT = 12, padB = 16;
-    var closes = bars.map(function (b) { return b[4]; });
-    var min = Math.min.apply(null, closes), max = Math.max.apply(null, closes);
-    var span = max - min || Math.max(max * 0.002, 0.01);
-    min -= span * 0.12; max += span * 0.12;
-    span = max - min;
-
-    var X = function (i) { return padL + (i / (bars.length - 1)) * (w - padL - padR); };
-    var Y = function (v) { return padT + (1 - (v - min) / span) * (h - padT - padB); };
-
-    // 网格
+    // 网格 + 纵轴刻度
     ctx.strokeStyle = light ? 'rgba(15,60,110,.10)' : 'rgba(120,200,255,.07)';
     ctx.lineWidth = 1;
-    for (var g = 0; g <= 3; g++) {
-      var gy = padT + (g / 3) * (h - padT - padB);
+    var span = g.vMax - g.vMin;
+    for (var i = 0; i <= 3; i++) {
+      var gy = g.padT + (i / 3) * (h - g.padT - g.padB);
       ctx.beginPath();
-      ctx.moveTo(padL, gy);
-      ctx.lineTo(w - padR, gy);
+      ctx.moveTo(g.padL, gy);
+      ctx.lineTo(w - g.padR, gy);
       ctx.stroke();
-      var gv = max - (g / 3) * span;
+      var gv = g.vMax - (i / 3) * span;
       ctx.fillStyle = light ? 'rgba(70,90,115,.88)' : 'rgba(124,135,152,.75)';
       ctx.font = '10px ui-monospace, monospace';
       ctx.textAlign = 'left';
-      ctx.fillText(gv.toFixed(max > 1000 ? 0 : 2), w - padR + 6, gy + 3);
+      ctx.fillText(g.compare
+        ? (gv > 0 ? '+' : '') + gv.toFixed(2) + '%'
+        : gv.toFixed(g.vMax > 1000 ? 0 : 2), w - g.padR + 6, gy + 3);
     }
 
-    var up = closes[closes.length - 1] >= closes[0];
-    var lineColor = up ? upColor() : downColor();
-    var rgb = up ? upRGB() : downRGB();
-
-    // 填充
-    var grad = ctx.createLinearGradient(0, padT, 0, h - padB);
-    grad.addColorStop(0, 'rgba(' + rgb + ',.30)');
-    grad.addColorStop(1, 'rgba(' + rgb + ',0)');
-    ctx.beginPath();
-    ctx.moveTo(X(0), Y(closes[0]));
-    for (var i = 1; i < closes.length; i++) ctx.lineTo(X(i), Y(closes[i]));
-    ctx.lineTo(X(closes.length - 1), h - padB);
-    ctx.lineTo(X(0), h - padB);
-    ctx.closePath();
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    // 折线
-    ctx.beginPath();
-    ctx.moveTo(X(0), Y(closes[0]));
-    for (var j = 1; j < closes.length; j++) ctx.lineTo(X(j), Y(closes[j]));
-    ctx.strokeStyle = lineColor;
-    ctx.lineWidth = 1.8;
-    ctx.lineJoin = 'round';
-    ctx.shadowColor = 'rgba(' + rgb + ',.55)';
-    ctx.shadowBlur = 8;
-    ctx.stroke();
-    ctx.shadowBlur = 0;
-
-    // 最后一个点
-    var lx = X(closes.length - 1), ly = Y(closes[closes.length - 1]);
-    ctx.beginPath();
-    ctx.arc(lx, ly, 3, 0, Math.PI * 2);
-    ctx.fillStyle = lineColor;
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(lx, ly, 6.5, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(' + rgb + ',.4)';
-    ctx.stroke();
-
-    // 现价标签
-    ctx.fillStyle = lineColor;
-    ctx.fillRect(w - padR + 2, ly - 8, padR - 4, 16);
-    ctx.fillStyle = isLight() ? '#ffffff' : '#05070c';
-    ctx.font = 'bold 10px ui-monospace, monospace';
+    // 横轴时间
+    ctx.fillStyle = light ? 'rgba(70,90,115,.72)' : 'rgba(124,135,152,.62)';
+    ctx.font = '9.5px ui-monospace, monospace';
+    var tMid = g.t0 + (g.t1 - g.t0) / 2;
+    ctx.textAlign = 'left';
+    ctx.fillText(timeTick(g.t0, g.period.k), g.padL, h - 7);
     ctx.textAlign = 'center';
-    ctx.fillText(closes[closes.length - 1].toFixed(max > 1000 ? 0 : 2), w - padR / 2, ly + 3.5);
+    ctx.fillText(timeTick(tMid, g.period.k), (g.padL + w - g.padR) / 2, h - 7);
+    ctx.textAlign = 'right';
+    ctx.fillText(timeTick(g.t1, g.period.k), w - g.padR, h - 7);
+
+    // 序列
+    g.items.forEach(function (it) {
+      var pts = it.pts;
+      if (pts.length < 2) return;
+      if (!g.compare) {
+        // 单品种保留渐变填充，观感与旧版一致
+        var rgb = hexRGB(it.color);
+        var grad = ctx.createLinearGradient(0, g.padT, 0, h - g.padB);
+        grad.addColorStop(0, 'rgba(' + rgb + ',.28)');
+        grad.addColorStop(1, 'rgba(' + rgb + ',0)');
+        ctx.beginPath();
+        ctx.moveTo(Xof(g, pts[0][0]), Yof(g, pts[0][1]));
+        for (var k = 1; k < pts.length; k++) ctx.lineTo(Xof(g, pts[k][0]), Yof(g, pts[k][1]));
+        ctx.lineTo(Xof(g, pts[pts.length - 1][0]), h - g.padB);
+        ctx.lineTo(Xof(g, pts[0][0]), h - g.padB);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+      }
+      ctx.beginPath();
+      ctx.moveTo(Xof(g, pts[0][0]), Yof(g, pts[0][1]));
+      for (var j = 1; j < pts.length; j++) ctx.lineTo(Xof(g, pts[j][0]), Yof(g, pts[j][1]));
+      ctx.strokeStyle = it.color;
+      ctx.lineWidth = g.compare ? 1.7 : 1.9;
+      ctx.lineJoin = 'round';
+      if (!g.compare) {
+        ctx.shadowColor = 'rgba(' + hexRGB(it.color) + ',.5)';
+        ctx.shadowBlur = 8;
+      }
+      ctx.stroke();
+      ctx.shadowBlur = 0;
+
+      // 末端点
+      var last = pts[pts.length - 1];
+      var lx = Xof(g, last[0]), ly = Yof(g, last[1]);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 3, 0, Math.PI * 2);
+      ctx.fillStyle = it.color;
+      ctx.fill();
+      if (!g.compare) {
+        ctx.beginPath();
+        ctx.arc(lx, ly, 6.5, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(' + hexRGB(it.color) + ',.4)';
+        ctx.stroke();
+        // 现价标签
+        var label = last[2][4].toFixed(g.vMax > 1000 ? 2 : 2);
+        ctx.fillStyle = it.color;
+        ctx.fillRect(w - g.padR + 2, ly - 8, g.padR - 4, 16);
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 10px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(label, w - g.padR / 2, ly + 3.5);
+      }
+    });
+
+    if (cross) drawCross(ctx, g, cross);
+  }
+
+  function drawCross(ctx, g, cross) {
+    var light = isLight();
+    var x = Xof(g, cross.ts);
+    var y = Math.max(g.padT, Math.min(g.h - g.padB, cross.y));
+    ctx.save();
+    ctx.strokeStyle = light ? 'rgba(40,60,85,.45)' : 'rgba(180,210,240,.45)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, g.padT); ctx.lineTo(x, g.h - g.padB); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(g.padL, y); ctx.lineTo(g.w - g.padR, y); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 右侧数值气泡（跟随手指）
+    var val = Yinv(g, y);
+    var txt = g.compare
+      ? (val > 0 ? '+' : '') + val.toFixed(2) + '%'
+      : val.toFixed(g.vMax > 1000 ? 0 : 2);
+    ctx.font = 'bold 10px ui-monospace, monospace';
+    var tw = ctx.measureText(txt).width + 10;
+    ctx.fillStyle = light ? 'rgba(30,50,75,.92)' : 'rgba(210,232,255,.92)';
+    roundRect(ctx, g.w - g.padR + 2, y - 8, Math.max(tw, g.padR - 4), 16, 3);
+    ctx.fill();
+    ctx.fillStyle = light ? '#ffffff' : '#05070c';
+    ctx.textAlign = 'center';
+    ctx.fillText(txt, g.w - g.padR + 2 + Math.max(tw, g.padR - 4) / 2, y + 3.5);
+
+    // 底部时间标记
+    var timeTxt = timeTick(cross.ts, g.period.k);
+    ctx.font = '10px ui-monospace, monospace';
+    var tw2 = ctx.measureText(timeTxt).width + 12;
+    var bx = Math.max(g.padL, Math.min(g.w - g.padR - tw2, x - tw2 / 2));
+    ctx.fillStyle = light ? 'rgba(30,50,75,.92)' : 'rgba(210,232,255,.92)';
+    roundRect(ctx, bx, g.h - g.padB + 3, tw2, 15, 3);
+    ctx.fill();
+    ctx.fillStyle = light ? '#ffffff' : '#05070c';
+    ctx.textAlign = 'center';
+    ctx.fillText(timeTxt, bx + tw2 / 2, g.h - g.padB + 14);
+
+    // 各序列在该时刻的点 + 顶部浮窗
+    var lines = [timeTick(cross.ts, g.period.k, true)];
+    g.items.forEach(function (it) {
+      var p = nearestPoint(it.pts, cross.ts);
+      if (!p) return;
+      var px = Xof(g, p[0]), py = Yof(g, p[1]);
+      ctx.beginPath();
+      ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+      ctx.fillStyle = it.color;
+      ctx.fill();
+      ctx.strokeStyle = light ? '#ffffff' : '#05070c';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+      var raw = p[2];
+      var pct = (raw[4] - it.pts[0][2][4]) / Math.max(it.pts[0][2][4], 1e-9) * 100;
+      lines.push(it.label + ' ' + raw[4].toFixed(g.compare ? 2 : 2)
+        + (g.compare ? '  ' + (pct > 0 ? '+' : '') + pct.toFixed(2) + '%' : '')
+        + '  高' + raw[2].toFixed(2) + ' 低' + raw[3].toFixed(2));
+    });
+    ctx.font = '10px ui-monospace, monospace';
+    var maxW = 0;
+    lines.forEach(function (s) { maxW = Math.max(maxW, ctx.measureText(s).width); });
+    var boxW = maxW + 16, boxH = lines.length * 14 + 8;
+    var boxX = g.padL + 4, boxY = g.padT + 2;
+    ctx.fillStyle = light ? 'rgba(255,255,255,.94)' : 'rgba(8,14,24,.92)';
+    ctx.strokeStyle = light ? 'rgba(20,50,90,.15)' : 'rgba(120,200,255,.18)';
+    ctx.lineWidth = 1;
+    roundRect(ctx, boxX, boxY, boxW, boxH, 5);
+    ctx.fill();
+    ctx.stroke();
+    ctx.textAlign = 'left';
+    lines.forEach(function (s, i) {
+      ctx.fillStyle = i === 0
+        ? (light ? 'rgba(70,90,115,.9)' : 'rgba(160,178,200,.85)')
+        : (light ? '#12263f' : '#dce9f7');
+      ctx.fillText(s, boxX + 8, boxY + 14 + i * 14);
+    });
+    ctx.restore();
+  }
+
+  function nearestPoint(pts, ts) {
+    if (!pts || !pts.length) return null;
+    var lo = 0, hi = pts.length - 1;
+    while (lo < hi) {
+      var mid = (lo + hi) >> 1;
+      if (pts[mid][0] < ts) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(pts[lo - 1][0] - ts) <= Math.abs(pts[lo][0] - ts)) return pts[lo - 1];
+    return pts[lo];
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function hexRGB(hex) {
+    var v = hex.replace('#', '');
+    if (v.length === 3) v = v[0] + v[0] + v[1] + v[1] + v[2] + v[2];
+    var n = parseInt(v, 16);
+    return ((n >> 16) & 255) + ',' + ((n >> 8) & 255) + ',' + (n & 255);
+  }
+
+  function timeTick(ts, periodKey, full) {
+    var d = new Date(ts);
+    var p = function (n) { return n < 10 ? '0' + n : '' + n; };
+    var hm = p(d.getHours()) + ':' + p(d.getMinutes());
+    if (periodKey === '1s' || periodKey === '30s' || full) {
+      hm += ':' + p(d.getSeconds());
+    }
+    if (periodKey === '1d') return (d.getMonth() + 1) + '/' + d.getDate();
+    return (full ? p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' : '') + hm;
+  }
+
+  function renderLegend(series, period, compare) {
+    var box = $('#chartLegend');
+    if (!box) return;
+    box.innerHTML = series.map(function (s) {
+      var last = s.bars.length ? s.bars[s.bars.length - 1][4] : null;
+      var first = s.bars.length ? s.bars[0][4] : null;
+      var pct = (last !== null && first) ? (last - first) / first * 100 : null;
+      return '<button class="lg' + (s.hidden ? ' off' : '') + '" data-code="' + s.code + '"'
+        + (compare ? '' : ' disabled') + '>'
+        + '<i style="background:' + s.color + '"></i>'
+        + '<span class="lg-name">' + esc(s.label) + '</span>'
+        + (compare
+          ? '<span class="lg-pct ' + chgClass(pct) + '">' + (pct === null ? '—' : (pct > 0 ? '+' : '') + pct.toFixed(2) + '%') + '</span>'
+          : '<span class="lg-pct">' + (last === null ? '—' : last.toFixed(2)) + '</span>')
+        + '</button>';
+    }).join('');
+    Array.prototype.forEach.call(box.querySelectorAll('.lg'), function (b) {
+      b.addEventListener('click', function () {
+        if (!S.compare) return;
+        var code = b.getAttribute('data-code');
+        S.hidden[code] = !S.hidden[code];
+        renderChart();
+      });
+    });
+  }
+
+  /** 按根数聚合（分钟线兜底用）。 */
+  function aggregate(bars, step) {
+    if (!step || step <= 1) return bars;
+    var out = [], cur = null, n = 0;
+    for (var i = 0; i < bars.length; i++) {
+      var b = bars[i];
+      if (!cur) cur = [b[0], b[1], b[2], b[3], b[4], b[5] || 0];
+      else {
+        cur[2] = Math.max(cur[2], b[2]);
+        cur[3] = Math.min(cur[3], b[3]);
+        cur[4] = b[4];
+        cur[5] += (b[5] || 0);
+        cur[0] = b[0];
+      }
+      if (++n >= step) { out.push(cur); cur = null; n = 0; }
+    }
+    if (cur) out.push(cur);
+    return out;
   }
 
   // ---------------- 指标 ----------------
@@ -493,7 +778,7 @@
         var src = it.source === 'llm' ? '<span class="badge llm">大模型</span>' : '';
         html += '<div class="hitem">'
           + '<div class="h-row1"><div class="h-who">' + esc(shortName(it.code))
-          + '<span>' + esc(it.horizon) + '</span></div>'
+          + '<span>' + esc(horizonLabel(it.horizon)) + '</span></div>'
           + '<div class="h-time">' + timeStr(it.created_at) + '</div></div>'
           + '<div class="h-row2">'
           + '<span class="' + dirClass(it.dir) + '">' + esc(it.dir) + '</span>'
@@ -517,6 +802,12 @@
     } catch (e) { /* ignore */ }
   }
 
+  function horizonLabel(k) {
+    var m = { '1m': '1分钟', '5m': '5分钟', '15m': '15分钟', '30m': '30分钟',
+      '4h': '4小时', '8h': '8小时', '1d': '1天', '1h': '1小时', '10m': '10分钟' };
+    return m[k] || k;
+  }
+
   function shortName(code) {
     var p = findProduct(code);
     return p ? p.short : code;
@@ -528,7 +819,7 @@
     var s = {};
     try {
       s = JSON.parse(DEMO
-        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.1.0"}'
+        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.2.0"}'
         : N.settings());
     } catch (e) { s = {}; }
     S.settings = s;
@@ -632,12 +923,30 @@
       box.innerHTML = '<div class="raw">' + esc(res.text) + '</div>';
       return;
     }
+    var overall = d.overall || d.direction || '—';
     var html = '<div class="llm-head">'
-      + '<span class="llm-dir ' + dirClass(d.direction) + '">' + esc(d.direction || '—') + '</span>'
-      + '<span class="muted">置信度 ' + (d.confidence ? (d.confidence * 100).toFixed(0) + '%' : '—') + '</span>'
+      + '<span class="llm-dir ' + dirClass(overall) + '">' + esc(overall) + '</span>'
+      + '<span class="muted">综合置信度 ' + (d.confidence ? (d.confidence * 100).toFixed(0) + '%' : '—') + '</span>'
       + '</div>';
-    if (d.target_low || d.target_high) {
-      html += '<div class="muted">目标区间 ' + num(d.target_low, 1) + ' ~ ' + num(d.target_high, 1) + '</div>';
+
+    var hs = d.horizons || [];
+    if (hs.length) {
+      html += '<div class="llm-matrix">';
+      hs.forEach(function (h) {
+        var dir = h.direction || '—';
+        var lo = h.target_low, hi = h.target_high;
+        var hasRange = lo !== undefined && hi !== undefined && lo !== null && hi !== null;
+        html += '<div class="lm-item">'
+          + '<div class="lm-line">'
+          + '<span class="lm-k">' + esc(h.label || h.key || '') + '</span>'
+          + '<span class="lm-d ' + dirClass(dir) + '">' + esc(dir) + '</span>'
+          + '<span class="lm-c">' + (h.confidence ? Math.round(h.confidence * 100) + '%' : '—') + '</span>'
+          + '<span class="lm-t">' + (hasRange ? num(lo, 2) + ' ~ ' + num(hi, 2) : '—') + '</span>'
+          + '</div>'
+          + (h.note ? '<div class="lm-note">' + esc(h.note) + '</div>' : '')
+          + '</div>';
+      });
+      html += '</div>';
     }
     if (d.reasons && d.reasons.length) {
       html += '<div class="llm-sec"><b>判断依据</b><ul>';
@@ -746,6 +1055,90 @@
         });
         renderChart();
       });
+    });
+
+    // 单品种 / 三品种对比
+    var mc = $('#modeChips');
+    var MODES = [{ k: 'single', l: '单品种' }, { k: 'compare', l: '三品种对比' }];
+    function renderModeChips() {
+      mc.innerHTML = MODES.map(function (m) {
+        var on = m.k === 'compare' ? !!S.compare : !S.compare;
+        return '<button class="chip' + (on ? ' on' : '') + '" data-m="' + m.k + '">' + m.l + '</button>';
+      }).join('');
+    }
+    renderModeChips();
+    mc.addEventListener('click', function (e) {
+      var b = e.target.closest('.chip');
+      if (!b) return;
+      S.compare = b.getAttribute('data-m') === 'compare';
+      try { localStorage.setItem('ff_compare', S.compare ? '1' : '0'); } catch (err) { }
+      renderModeChips();
+      renderChart();
+      toast(S.compare ? '三品种对比：纵轴为相对窗口首点的涨跌幅' : '已切回单品种');
+    });
+    try { S.compare = localStorage.getItem('ff_compare') === '1'; } catch (err) { }
+    renderModeChips();
+
+    // 十字星：按住拖动查看时间与价格
+    var cv = $('#chart');
+    var dragging = false;
+    var crossOf = function (e) {
+      var g = S.chart;
+      if (!g) return null;
+      var rect = cv.getBoundingClientRect();
+      var x = e.clientX - rect.left;
+      var y = e.clientY - rect.top;
+      if (x < g.padL - 8 || x > g.w - g.padR + 8) return null;
+      var ts = Xinv(g, x);
+      var primary = g.items.length ? g.items[0] : null;
+      var p = primary ? nearestPoint(primary.pts, ts) : null;
+      return {
+        ts: p ? p[0] : ts,
+        y: Math.max(g.padT, Math.min(g.h - g.padB, y))
+      };
+    };
+    var showCross = function (cross) {
+      if (S.crossTimer) { clearTimeout(S.crossTimer); S.crossTimer = 0; }
+      if (!S.chart) return;
+      paint(cross);
+    };
+    var hideCross = function (after) {
+      if (S.crossTimer) clearTimeout(S.crossTimer);
+      S.crossTimer = setTimeout(function () {
+        S.crossTimer = 0;
+        paint(null);
+      }, after || 0);
+    };
+    cv.addEventListener('pointerdown', function (e) {
+      var c = crossOf(e);
+      if (!c) return;
+      dragging = true;
+      try { cv.setPointerCapture(e.pointerId); } catch (err) { }
+      showCross(c);
+      e.preventDefault();
+    });
+    cv.addEventListener('pointermove', function (e) {
+      if (!dragging && e.pointerType === 'mouse') {
+        var c0 = crossOf(e);
+        if (c0) showCross(c0); else paint(null);
+        return;
+      }
+      if (!dragging) return;
+      var c = crossOf(e);
+      if (c) showCross(c);
+      e.preventDefault();
+    });
+    cv.addEventListener('pointerup', function () {
+      if (!dragging) return;
+      dragging = false;
+      hideCross(2500);
+    });
+    cv.addEventListener('pointercancel', function () {
+      dragging = false;
+      hideCross(0);
+    });
+    cv.addEventListener('pointerleave', function () {
+      if (!dragging) hideCross(400);
     });
 
     // 品种 chips
@@ -895,8 +1288,9 @@
   }
 
   function demoForecast(price) {
-    var hs = [['1m', '1分钟', 0.53], ['5m', '5分钟', 0.57], ['10m', '10分钟', 0.61],
-              ['1h', '1小时', 0.64], ['8h', '8小时', 0.48], ['1d', '1天', 0.44]];
+    var hs = [['1m', '1分钟', 0.53, 1], ['5m', '5分钟', 0.57, 5], ['15m', '15分钟', 0.61, 15],
+              ['30m', '30分钟', 0.54, 30], ['4h', '4小时', 0.47, 240],
+              ['8h', '8小时', 0.48, 480], ['1d', '1天', 0.44, 1440]];
     return {
       price: price, score: 0.22, overall: '中性',
       recommendation: '短线偏多：回踩短均线不破可轻仓跟随，跌破 EMA20 止损；多周期方向不一致，优先降低杠杆',
@@ -907,7 +1301,7 @@
       horizons: hs.map(function (h) {
         var d = h[2] >= 0.55 ? '上涨' : h[2] <= 0.45 ? '下跌' : '震荡';
         return {
-          key: h[0], label: h[1], minutes: 1, direction: d, p_up: h[2],
+          key: h[0], label: h[1], minutes: h[3], direction: d, p_up: h[2],
           target_price: price * (1 + (h[2] - 0.5) * 0.02), confidence: Math.abs(h[2] - 0.5) * 2
         };
       })
@@ -924,27 +1318,45 @@
     return out;
   }
 
-  function demoBars(code, step) {
+  function demoSeries(code, period) {
     var base = code === 'AL' ? 20380 : code === 'AO' ? 3126 : 2612;
-    var n = 180, out = [], v = base;
+    var phase = code === 'AL' ? 0 : code === 'AO' ? 1.1 : 2.3;
+    var out = [], v = base;
+    var tick = period && period.tick !== undefined;
+    var n = tick ? 160 : 180;
+    var gap = tick ? (period.tick === 0 ? 5000 : 30000) : 60000;
     for (var i = 0; i < n; i++) {
-      var drift = Math.sin(i / 14) * base * 0.0016 + (Math.random() - 0.5) * base * 0.0009;
+      var drift = Math.sin(i / 14 + phase) * base * 0.0016 + (Math.random() - 0.5) * base * 0.0009;
       v += drift;
-      out.push([Date.now() - (n - i) * 60000, v, v * 1.0008, v * 0.9992, v, 1000 + Math.random() * 500]);
+      var h = v * 1.0008, l = v * 0.9992;
+      out.push([Date.now() - (n - i) * gap, v, h, l, v, tick ? 1 : Math.round(1000 + Math.random() * 500)]);
     }
-    return { code: code, period: '1m', bars: out };
+    return out;
   }
 
   function demoLlm() {
+    var price = 20380;
+    var ks = [['1m', '1分钟', '看涨', 0.58], ['5m', '5分钟', '看涨', 0.62],
+              ['15m', '15分钟', '看涨', 0.6], ['30m', '30分钟', '震荡', 0.52],
+              ['4h', '4小时', '震荡', 0.5], ['8h', '8小时', '看跌', 0.56],
+              ['1d', '1天', '看跌', 0.54]];
     return {
       ok: true,
       code: S.code,
       data: {
-        direction: '看涨', confidence: 0.62,
-        target_low: 20420, target_high: 20560,
-        reasons: ['短周期均线呈多头排列，EMA5 上穿 EMA20', 'RSI 58 处于强势区但未超买', '成交量温和放大，价格站上布林中轨'],
-        risks: ['8 小时与日线周期方向不一致，存在回调压力', '临近交割月波动可能放大'],
-        action: '回踩 20300 附近轻仓试多，跌破 20180 止损'
+        overall: '震荡', confidence: 0.55,
+        action: '短线回踩 20300 附近轻仓试多，跌破 20180 止损；8 小时以上偏空，多单不隔夜',
+        reasons: ['1–15 分钟均线多头排列，短周期动能向上', 'RSI 58 处于强势区但未超买', '日线仍在下降通道内，反弹高度受限'],
+        risks: ['8 小时与日线方向向下，存在回调压力', '临近交割月波动可能放大'],
+        horizons: ks.map(function (k) {
+          var up = k[2] === '看涨', down = k[2] === '看跌';
+          return {
+            key: k[0], label: k[1], direction: k[2], confidence: k[3],
+            target_low: up ? price * 1.001 : down ? price * 0.985 : price * 0.996,
+            target_high: up ? price * 1.012 : down ? price * 0.998 : price * 1.004,
+            note: k[2] === '震荡' ? '区间内反复，等突破' : '跟随短周期动能'
+          };
+        })
       }
     };
   }

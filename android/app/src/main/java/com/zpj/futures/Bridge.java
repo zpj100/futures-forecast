@@ -12,6 +12,7 @@ import com.zpj.futures.data.Products;
 import com.zpj.futures.data.SinaClient;
 import com.zpj.futures.db.Bar;
 import com.zpj.futures.db.Store;
+import com.zpj.futures.quant.Forecaster;
 import com.zpj.futures.update.Updater;
 
 import org.json.JSONArray;
@@ -112,6 +113,36 @@ public class Bridge {
     @JavascriptInterface
     public String sparkline(String code, int points) {
         return engine.sparkline(code, points).toString();
+    }
+
+    /**
+     * 秒级曲线：bucketSec<=0 返回原始采集点，>0 按时间桶聚合成 OHLC。
+     * 数据来自本机产生的 ticks，公开接口不提供秒级历史。
+     */
+    @JavascriptInterface
+    public String tickSeries(String code, int bucketSec, int limit) {
+        JSONObject o = new JSONObject();
+        try {
+            JSONArray arr = new JSONArray();
+            List<double[]> rows = store.tickSeries(code, bucketSec, limit);
+            for (double[] r : rows) {
+                JSONArray row = new JSONArray();
+                row.put((long) r[0]);
+                row.put(round(r[1]));
+                row.put(round(r[2]));
+                row.put(round(r[3]));
+                row.put(round(r[4]));
+                row.put((long) r[5]);
+                arr.put(row);
+            }
+            o.put("code", code);
+            o.put("bucket", bucketSec);
+            o.put("points", arr);
+            o.put("count", arr.length());
+            o.put("last_tick", engine.lastTick());
+        } catch (Exception ignored) {
+        }
+        return o.toString();
     }
 
     @JavascriptInterface
@@ -247,24 +278,21 @@ public class Bridge {
                 Map<String, SinaClient.Quote> qs = engine.quotes();
                 SinaClient.Quote quote = qs.get(code);
                 double price = quote != null ? quote.last : f.optDouble("price", 0);
-                List<double[]> recent = store.recentTicks(code, 60);
+                // 给模型喂多周期统计，而不是只喂 60 个采样点
+                Map<String, List<Bar>> series = new java.util.HashMap<>();
+                for (String p : new String[]{"1m", "5m", "15m", "30m", "60m", "1d"}) {
+                    series.put(p, engine.bars(code, p));
+                }
+                List<double[]> recent = store.recentTicks(code, 40);
                 LlmClient.Result r = llm.analyze(Products.nameOf(code), price, f,
-                        recent, Products.unitOf(code));
+                        series, recent, Products.unitOf(code));
                 payload.put("ok", r.ok);
                 payload.put("code", code);
                 payload.put("text", r.text);
                 payload.put("data", r.data == null ? JSONObject.NULL : r.data);
-                // 落库留档，便于回看
-                if (r.ok) {
-                    JSONObject d = r.data;
-                    String dir = d != null ? d.optString("direction", "震荡") : "震荡";
-                    double conf = d != null ? d.optDouble("confidence", 0.5) : 0.5;
-                    double lo = d != null ? d.optDouble("target_low", price) : price;
-                    double hi = d != null ? d.optDouble("target_high", price) : price;
-                    String reason = d != null ? joinReasons(d) : r.text;
-                    store.addForecast(code, "1h", dir, conf, (lo + hi) / 2, price,
-                            conf, "llm", reason, System.currentTimeMillis(),
-                            System.currentTimeMillis() + 60 * 60_000L);
+                // 逐周期落库：历史页可按周期看命中率
+                if (r.ok && r.data != null) {
+                    saveLlmForecasts(code, price, r.data);
                 }
             } catch (Exception e) {
                 try {
@@ -276,6 +304,31 @@ public class Bridge {
             }
             emit("onLlm", payload.toString());
         });
+    }
+
+    private void saveLlmForecasts(String code, double price, JSONObject d) {
+        try {
+            JSONArray hs = d.optJSONArray("horizons");
+            if (hs == null) return;
+            long now = System.currentTimeMillis();
+            String overall = d.optString("action", joinReasons(d));
+            for (int i = 0; i < hs.length(); i++) {
+                JSONObject h = hs.optJSONObject(i);
+                if (h == null) continue;
+                String key = h.optString("key", "");
+                String dir = h.optString("direction", "");
+                if (key.isEmpty() || dir.isEmpty() || "—".equals(dir)) continue;
+                double lo = h.optDouble("target_low", price);
+                double hi = h.optDouble("target_high", price);
+                String note = h.optString("note", "");
+                String reason = note.isEmpty() ? overall
+                        : note + (overall.isEmpty() ? "" : "｜" + overall);
+                store.addForecast(code, key, dir, h.optDouble("confidence", 0.5),
+                        (lo + hi) / 2, price, h.optDouble("confidence", 0.5),
+                        "llm", reason, now, Forecaster.dueAt(key));
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     private static String joinReasons(JSONObject d) {

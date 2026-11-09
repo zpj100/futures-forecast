@@ -18,16 +18,22 @@ import java.util.List;
  */
 public class Forecaster {
 
+    /**
+     * 预测档位：与大模型分析的周期一一对应，便于互相印证。
+     * 3 位是「分钟数」，用于到期时间与展示；实际计算以 {源序列, 每根代表的分钟数} 决定。
+     */
     public static final String[][] HORIZONS = {
             {"1m", "1分钟", "1"},
             {"5m", "5分钟", "5"},
-            {"10m", "10分钟", "10"},
-            {"1h", "1小时", "60"},
+            {"15m", "15分钟", "15"},
+            {"30m", "30分钟", "30"},
+            {"4h", "4小时", "240"},
             {"8h", "8小时", "480"},
             {"1d", "1天", "1440"},
     };
 
-    public static JSONObject forecast(String code, List<Bar> minute, List<Bar> daily) {
+    public static JSONObject forecast(String code, List<Bar> minute, List<Bar> hour60,
+                                      List<Bar> daily) {
         JSONObject out = new JSONObject();
         double price = !minute.isEmpty() ? minute.get(minute.size() - 1).c
                 : (!daily.isEmpty() ? daily.get(daily.size() - 1).c : 0);
@@ -36,9 +42,25 @@ public class Forecaster {
 
         for (String[] h : HORIZONS) {
             String key = h[0];
-            int step = Integer.parseInt(h[2]);
-            List<Bar> src = step >= 480 ? daily : minute;
-            JSONObject r = one(key, h[1], step, src, price);
+            int minutes = Integer.parseInt(h[2]);
+            // 4h/8h 由 60 分钟线聚合，日线直接用，其余用 1 分钟线；
+            // 聚合后「下一根」就是目标周期，因此走前验证的步长按 1 根算
+            List<Bar> src;
+            int horizonBars, lookback;
+            if (minutes >= 1440) {
+                src = daily;
+                horizonBars = 1;
+                lookback = 20;
+            } else if (minutes >= 240) {
+                src = aggregate(hour60, minutes / 60);
+                horizonBars = 1;
+                lookback = 6;
+            } else {
+                src = minute;
+                horizonBars = minutes;
+                lookback = minutes;
+            }
+            JSONObject r = one(key, h[1], minutes, src, horizonBars, lookback, price);
             horizons.put(r);
             double conf = r.optDouble("confidence", 0);
             double dir = "上涨".equals(r.optString("direction")) ? 1
@@ -67,14 +89,38 @@ public class Forecaster {
         return out;
     }
 
-    private static JSONObject one(String key, String label, int step,
-                                  List<Bar> bars, double fallbackPrice) {
+    /** 把 group 根合成一根（OHLCV），用于 60m → 4h/8h。 */
+    static List<Bar> aggregate(List<Bar> src, int group) {
+        List<Bar> out = new ArrayList<>();
+        if (src == null || src.isEmpty() || group <= 1) return src == null ? out : src;
+        int n = 0;
+        Bar cur = null;
+        for (Bar b : src) {
+            if (cur == null) {
+                cur = new Bar(b.ts, b.o, b.h, b.l, b.c, b.v);
+            } else {
+                cur = new Bar(b.ts, cur.o, Math.max(cur.h, b.h),
+                        Math.min(cur.l, b.l), b.c, cur.v + b.v);
+            }
+            if (++n >= group) {
+                out.add(cur);
+                cur = null;
+                n = 0;
+            }
+        }
+        if (cur != null) out.add(cur);
+        return out;
+    }
+
+    private static JSONObject one(String key, String label, int minutes,
+                                  List<Bar> bars, int horizonBars, int lookback,
+                                  double fallbackPrice) {
         JSONObject o = new JSONObject();
-        if (bars == null || bars.size() < Math.max(step + 12, 30)) {
+        if (bars == null || bars.size() < Math.max(horizonBars + 12, 30)) {
             try {
                 o.put("key", key);
                 o.put("label", label);
-                o.put("minutes", step);
+                o.put("minutes", minutes);
                 o.put("direction", "数据不足");
                 o.put("p_up", 0.5);
                 o.put("exp_move_pct", 0);
@@ -96,7 +142,7 @@ public class Forecaster {
         double[] trend = trendSignal(c);
         double[] rev = reversionSignal(c);
         double[] boll = bollSignal(c);
-        int lb = Math.max(step, 3);
+        int lb = Math.max(lookback, 1);
         double[] mom = momentumSignal(c, lb);
 
         String[] names = {"trend", "reversion", "boll", "momentum"};
@@ -105,7 +151,7 @@ public class Forecaster {
 
         double weighted = 0, wsum = 0, bestHit = 0;
         for (int i = 0; i < names.length; i++) {
-            double hit = walkForward(c, sigs[i], step);
+            double hit = walkForward(c, sigs[i], horizonBars);
             double excess = Math.max(0, hit - 0.5);
             double w = excess >= 0.02 ? excess : 0;
             double sv = sigs[i][n - 1];
@@ -140,7 +186,7 @@ public class Forecaster {
         if (wsum > 0) {
             double conviction = weighted / wsum;
             double evidence = Math.min(wsum / 0.25, 1.0);
-            double horizonScale = sigma * Math.sqrt(step) * 0.5;
+            double horizonScale = sigma * Math.sqrt(horizonBars) * 0.5;
             edge = conviction * horizonScale * evidence;
             double pRaw = phi(edge / sigma);
             double cap = 0.5 + 0.35 * Math.min(wsum / 0.20, 1.0);
@@ -154,7 +200,7 @@ public class Forecaster {
         try {
             o.put("key", key);
             o.put("label", label);
-            o.put("minutes", step);
+            o.put("minutes", minutes);
             o.put("direction", dir);
             o.put("p_up", Indicators.round(pUp, 4));
             o.put("exp_move_pct", Indicators.round(expPct, 4));

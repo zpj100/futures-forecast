@@ -298,16 +298,38 @@ html.light .chip.on {
 .chips.small .chip { padding: 4px 8px; font-size: 10.5px; }
 
 /* ---------- chart ---------- */
-.chart-wrap { position: relative; margin: 8px 0 2px; height: 178px; }
-#chart { width: 100%; height: 178px; display: block; }
+.chart-wrap { position: relative; margin: 8px 0 2px; height: 200px; }
+#chart {
+  width: 100%; height: 200px; display: block;
+  touch-action: none;          /* 十字星需要完整的手势事件 */
+  cursor: crosshair;
+}
 .chart-empty {
   position: absolute; inset: 0;
   display: grid; place-items: center;
   color: var(--muted); font-size: 12px;
   pointer-events: none;
 }
-.chart-foot { margin-top: 5px; text-align: right; line-height: 1.4; }
-.chart-foot .muted { font-size: 10.5px; }
+.chart-foot {
+  margin-top: 5px; line-height: 1.4;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+}
+.chart-foot .muted { font-size: 10.5px; text-align: right; }
+.chart-tip { flex: 0 0 auto; font-size: 9.5px; color: var(--muted); opacity: .72; }
+
+/* ---------- 图例 ---------- */
+.chart-legend { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.chart-legend .lg {
+  display: inline-flex; align-items: center; gap: 5px;
+  border: 1px solid var(--line); background: var(--inner);
+  border-radius: 8px; padding: 3px 8px; color: var(--text);
+  font-family: var(--mono); font-size: 10.5px;
+}
+.chart-legend .lg[disabled] { opacity: 1; }
+.chart-legend .lg.off { opacity: .38; }
+.chart-legend .lg i { width: 7px; height: 7px; border-radius: 2px; display: block; }
+.chart-legend .lg-name { color: var(--muted); }
+.chart-legend .lg-pct { font-weight: 600; }
 
 /* ---------- indicators ---------- */
 .ind-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
@@ -560,3 +582,32 @@ html.light .btn.danger { background: #ffffff; color: var(--up); border-color: rg
   box-shadow: 0 10px 26px -18px rgba(0, 0, 0, .8);
 }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---------- 大模型七周期矩阵 ---------- */
+.llm-matrix {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.lm-item { border-bottom: 1px solid var(--line); padding: 7px 9px; }
+.lm-item:last-child { border-bottom: 0; }
+.lm-line {
+  display: grid;
+  grid-template-columns: 48px 44px 40px 1fr;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.lm-k { color: var(--muted); font-size: 11px; }
+.lm-d { font-weight: 700; }
+.lm-c { color: var(--muted); font-size: 11px; }
+.lm-t { text-align: right; font-size: 11.5px; color: var(--text); }
+.lm-note {
+  margin-top: 3px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+html.light .lm-t { color: #16324f; }

@@ -42,12 +42,17 @@
 
       <div class="panel">
         <div class="chips" id="prodChips"></div>
+        <div class="chips small" id="modeChips"></div>
         <div class="chart-wrap">
           <canvas id="chart"></canvas>
           <div class="chart-empty" id="chartEmpty">等待数据…<br><span class="muted" style="font-size:11px">本地无该周期K线，正在自动同步</span></div>
         </div>
+        <div class="chart-legend" id="chartLegend"></div>
         <div class="chips small" id="periodChips"></div>
-        <div class="chart-foot"><span class="muted" id="chartMeta">—</span></div>
+        <div class="chart-foot">
+          <span class="muted" id="chartMeta">—</span>
+          <span class="chart-tip">按住图表拖动可查看十字星</span>
+        </div>
       </div>
 
       <div class="panel">
@@ -70,17 +75,17 @@
       </div>
 
       <div class="panel">
-        <div class="panel-title">六周期方向</div>
+        <div class="panel-title">七周期方向（量化模型）</div>
         <div class="hz-grid" id="hzGrid"></div>
       </div>
 
       <div class="panel">
         <div class="row-between">
-          <div class="panel-title">大模型分析</div>
+          <div class="panel-title">大模型多周期趋势</div>
           <button id="btnLlm" class="btn ghost">生成分析</button>
         </div>
         <div id="llmBox" class="llm">
-          <div class="muted">在「设置」填写模型 API Key 后，可让大模型结合当前指标与曲线给出独立判断。</div>
+          <div class="muted">在「设置」填写模型 API Key 后，可让大模型基于历史数据给出 1分钟 / 5分钟 / 15分钟 / 30分钟 / 4小时 / 8小时 / 1天 七个周期的趋势建议与目标区间。</div>
         </div>
       </div>
     </section>

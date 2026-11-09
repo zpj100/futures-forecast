@@ -96,6 +96,62 @@ public class Store extends SQLiteOpenHelper {
         return out;
     }
 
+    /**
+     * 秒级曲线数据：把 ticks 按时间桶聚合成 OHLC。
+     * bucketSec<=0 表示不聚合，直接返回原始采集点（每点 o=h=l=c=price）。
+     * 返回按时间升序，元素为 [ts, o, h, l, c, n]；ts 取桶起点，保证时间轴稳定。
+     *
+     * <p>秒级数据只能来自本机采集（公开接口不提供秒级历史），
+     * 采集频率由「自动刷新间隔」决定，因此 1s 视图在默认 30s 间隔下
+     * 实际是 30 秒一个点，界面必须如实说明。
+     */
+    public List<double[]> tickSeries(String code, int bucketSec, int limit) {
+        List<double[]> out = new ArrayList<>();
+        int max = Math.max(2, limit);
+        long now = System.currentTimeMillis();
+        long window = bucketSec > 0
+                ? Math.max(bucketSec, 1) * 1000L * max * 2L
+                : 86400_000L;
+        // 原始点可能很多（30 天 × 每次采集 1 点），先按时间窗截断再取尾部
+        String sql = bucketSec > 0
+                ? "SELECT ts, price FROM ticks WHERE code=? AND ts>=? ORDER BY ts ASC"
+                : "SELECT ts, price FROM (SELECT ts, price FROM ticks WHERE code=? AND ts>=?"
+                + " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC";
+        Cursor c = bucketSec > 0
+                ? getReadableDatabase().rawQuery(sql, new String[]{code, String.valueOf(now - window)})
+                : getReadableDatabase().rawQuery(sql,
+                new String[]{code, String.valueOf(now - window), String.valueOf(max)});
+        try {
+            double curO = 0, curH = 0, curL = 0, curC = 0;
+            long curTs = 0;
+            int cnt = 0;
+            while (c.moveToNext()) {
+                long ts = c.getLong(0);
+                double p = c.getDouble(1);
+                long b = bucketSec > 0 ? (ts / (bucketSec * 1000L)) * (bucketSec * 1000L) : ts;
+                if (cnt > 0 && b != curTs) {
+                    out.add(new double[]{curTs, curO, curH, curL, curC, cnt});
+                    cnt = 0;
+                }
+                if (cnt == 0) {
+                    curTs = b;
+                    curO = curH = curL = curC = p;
+                } else {
+                    curH = Math.max(curH, p);
+                    curL = Math.min(curL, p);
+                    curC = p;
+                }
+                cnt++;
+            }
+            if (cnt > 0) out.add(new double[]{curTs, curO, curH, curL, curC, cnt});
+        } finally {
+            c.close();
+        }
+        // 只保留尾部 limit 个桶
+        if (out.size() > max) return new ArrayList<>(out.subList(out.size() - max, out.size()));
+        return out;
+    }
+
     // ---------------- kline ----------------
 
     public void upsertKlines(String code, String period, List<Bar> bars) {
