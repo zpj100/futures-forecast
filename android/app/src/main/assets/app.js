@@ -701,7 +701,8 @@
     if (!o) { info.textContent = '检查失败'; return; }
     if (!o.ok) { info.textContent = o.message || '检查失败'; return; }
     if (o.has_update) {
-      info.textContent = '发现新版本 ' + o.version + '（' + Math.round((o.size || 0) / 1048576 * 10) / 10 + ' MB）\n'
+      var src = o.source === 'gitee' ? 'Gitee' : (o.source || 'Gitee');
+      info.textContent = '发现新版本 ' + o.version + '（' + (o.size ? Math.round(o.size / 1048576 * 10) / 10 + ' MB · ' : '') + src + '）\n'
         + (o.notes || '');
       $('#btnUpdateInstall').disabled = false;
     } else {

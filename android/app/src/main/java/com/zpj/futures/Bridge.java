@@ -307,7 +307,9 @@ public class Bridge {
                 o.put("notes", info.notes == null ? "" : stripNotes(info.notes));
                 o.put("message", info.message);
                 o.put("apk_url", info.apkUrl);
+                o.put("apk_name", info.apkName);
                 o.put("size", info.size);
+                o.put("source", info.source);
             } catch (Exception ignored) {
             }
             emit("onUpdate", o.toString());

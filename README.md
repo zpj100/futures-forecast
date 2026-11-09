@@ -140,32 +140,45 @@ bash android/build-apk.sh
 源站每周期最多返回 1023 根，因此 1 分钟线只能覆盖最近几个交易日；**秒级点公开接口不提供历史，
 只能由 App 运行时累积**（保留 30 天），预置包里不含伪造的秒级数据。
 
-产物：`releases/futures-forecast-v2.1.0.apk`（约 2.4 MB，已签名，minSdk 24）
+产物：`releases/futures-forecast-v2.1.1.apk`（约 3.0 MB，已签名，minSdk 24）
 
 装好后无需任何配置即可看到行情；要大模型分析就在「设置」填 API Key，
 要 App 内自助更新就在「设置」填 Gitee 个人令牌。
 
 ## 八、版本与自动更新
 
-版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.1.0 → 210），Release 正文首行标注 `versionCode: 210`。
+版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.1.1 → 211），Release 正文首行标注 `versionCode: 211`。
 
-App 内「设置 → 应用更新」会带令牌读取本仓库 `releases/latest`，比较 `versionCode` 后下载并调起安装。
-私有仓库读取与下载都需要令牌，令牌只存手机端（AndroidKeyStore 加密），不上传任何服务器。
+**更新源固定为 Gitee（首要源）**：App 内「设置 → 应用更新」带令牌读取本仓库 `releases/latest`，
+比较 `versionCode` 后下载并调起安装。令牌只存手机端（AndroidKeyStore 加密），不上传任何服务器。
+
+> **为什么必须走附件 API（v2.1.1 修复 403）**
+> 私有仓库的发行版直链 `https://gitee.com/zpj100/futures-forecast/releases/download/v2.1.1/xxx.apk`
+> 无论带 `Authorization: token` 头还是 `?access_token=` **都返回 403**（该地址要浏览器登录态 Cookie）。
+> 唯一可用路径是附件接口：
+>
+> ```
+> GET https://gitee.com/api/v5/repos/{owner}/{repo}/releases/{release_id}/attach_files/{attach_file_id}/download?access_token=xxx
+> ```
+>
+> 它 303 跳到 `foruda.gitee.com` 的临时签名地址，客户端需**手动逐跳跟随**（Java 默认自动跳转会丢参数）。
+> `attach_file_id` 与文件体积只能从 `/releases/{id}/attach_files` 列表取——
+> `releases/latest` 的 `assets` 里既没有 id 也没有 size。
 
 `release/version.json` 保留为可读的版本清单，便于脚本或第三方读取：
 
 ```json
 {
-  "version": "2.1.0",
-  "versionCode": 210,
+  "version": "2.1.1",
+  "versionCode": 211,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "notes": "…"
 }
 ```
 
 发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName`
-→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.1.0`）
-→ 创建 Gitee Release 并上传 APK → `python3 scripts/delete_asset.py` 可清理旧附件。
+→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.1.1`）
+→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 211`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
 
 ## 九、免责声明
 

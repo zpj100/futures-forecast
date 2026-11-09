@@ -1,7 +1,7 @@
 {
-  "version": "2.1.0",
-  "versionCode": 210,
+  "version": "2.1.1",
+  "versionCode": 211,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.1.0：更名「学记期货」并重做图标（白色方框 + 双行文字）；行情页三品种一屏并排；设置内新增黑夜/白天配色；新增 30 分钟周期；安装包内置约 1.9 万根真实分钟线/日线，设置页可一键同步最近 180 天数据。"
+  "notes": "v2.1.1：修复应用内更新下载 HTTP 403——Gitee 私有仓库的发行版直链需要浏览器登录态，改为走附件 API 下载并手动跟随 303 跳转；更新源固定为 Gitee（首要源），令牌失效/无权限给出明确提示。"
 }
