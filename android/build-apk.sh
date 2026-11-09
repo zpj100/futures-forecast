@@ -1,13 +1,32 @@
 #!/bin/bash
-# 一键构建 APK。环境：WSL Debian + JDK 21 + Gradle 8.9 + Android SDK 34。
+# 一键构建 APK。需要 JDK 17+ 与 Gradle 8.2+，Android SDK 34。
+# 可用环境变量覆盖：JAVA_HOME、GRADLE_BIN、ANDROID_HOME。
 set -euo pipefail
 
-JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
-export JAVA_HOME
+pick_jdk() {
+  for d in "${JAVA_HOME:-}" /usr/lib/jvm/java-21-openjdk-amd64 \
+           /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/java-17-openjdk; do
+    if [ -n "$d" ] && [ -x "$d/bin/javac" ]; then echo "$d"; return 0; fi
+  done
+  return 1
+}
+pick_gradle() {
+  for g in "${GRADLE_BIN:-}" /opt/gradle-8.9/bin/gradle /opt/gradle-8.2.1/bin/gradle; do
+    if [ -n "$g" ] && [ -x "$g" ]; then echo "$g"; return 0; fi
+  done
+  command -v gradle || return 1
+}
+
+JDK="$(pick_jdk)" || { echo "未找到 JDK 17+"; exit 1; }
+export JAVA_HOME="$JDK"
 export ANDROID_HOME="${ANDROID_HOME:-/opt/android-sdk}"
 export ANDROID_SDK_ROOT="$ANDROID_HOME"
-GRADLE_BIN="${GRADLE_BIN:-/opt/gradle-8.9/bin/gradle}"
+GRADLE_BIN="$(pick_gradle)" || { echo "未找到 Gradle 8.2+"; exit 1; }
 export PATH="$JAVA_HOME/bin:$ANDROID_HOME/cmdline-tools/latest/bin:$(dirname "$GRADLE_BIN"):$PATH"
+
+echo "==> JDK     : $JAVA_HOME"
+echo "==> Gradle  : $GRADLE_BIN"
+echo "==> SDK     : $ANDROID_HOME"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
