@@ -3,8 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<meta name="theme-color" content="#05070C">
-<title>铝期货 · 趋势预测</title>
+<meta name="theme-color" content="#05070C" id="themeColor">
+<title>学记期货 · 趋势预测</title>
+<script>
+/* 首屏前先定主题，避免白/黑闪烁 */
+(function () {
+  var t = (location.search.match(/[?&]theme=(dark|light)/) || [])[1];
+  if (!t) {
+    try { t = JSON.parse(window.Native ? Native.settings() : '{"theme":"dark"}').theme; } catch (e) { }
+  }
+  if (t === 'light') document.documentElement.classList.add('light');
+})();
+</script>
 <link rel="stylesheet" href="app.css">
 </head>
 <body>
@@ -13,7 +23,7 @@
   <header class="hdr">
     <div class="brand">
       <span class="brand-dot"></span>
-      <b>AL · FUTURES</b>
+      <b>学记期货</b>
       <i id="brandVer">v2</i>
     </div>
     <div class="hdr-right">
@@ -36,10 +46,8 @@
           <canvas id="chart"></canvas>
           <div class="chart-empty" id="chartEmpty">等待数据…</div>
         </div>
-        <div class="row-between chart-foot">
-          <div class="chips small" id="periodChips"></div>
-          <span class="muted" id="chartMeta">—</span>
-        </div>
+        <div class="chips small" id="periodChips"></div>
+        <div class="chart-foot"><span class="muted" id="chartMeta">—</span></div>
       </div>
 
       <div class="panel">
@@ -88,6 +96,13 @@
     <section class="view" id="v-settings">
 
       <div class="panel">
+        <div class="panel-title">界面风格</div>
+        <div class="field-label">配色模式</div>
+        <div class="chips" id="themeChips"></div>
+        <div class="hint">白天模式适合户外强光下查看，切换后立即生效并记住选择。</div>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">数据刷新</div>
         <div class="field-label">自动刷新间隔（后台持续采集）</div>
         <div class="chips" id="intervalChips"></div>
@@ -122,13 +137,18 @@
 
       <div class="panel">
         <div class="panel-title">本地数据</div>
-        <div class="stat-row tight" id="dataStats"></div>
+        <div class="stat-row tight two" id="dataStats"></div>
+        <div class="row-btns">
+          <button class="btn" id="btnSyncHistory">同步历史数据</button>
+        </div>
+        <div class="hint" id="syncInfo">同步最近 180 天：日线 + 分钟线（源站每周期最多 1023 根，60 分钟线可覆盖约 195 天）。安装包内已预置一份，平常无需手动同步。</div>
         <div class="row-btns">
           <button class="btn ghost danger" id="btnClearFc">清空预测记录</button>
         </div>
       </div>
 
       <div class="panel about">
+        <div class="about-row"><span>应用</span><b>学记期货</b></div>
         <div class="about-row"><span>版本</span><b id="aboutVer">—</b></div>
         <div class="about-row"><span>数据源</span><span>新浪公开行情</span></div>
         <div class="about-row"><span>存储</span><span>手机本地 SQLite</span></div>

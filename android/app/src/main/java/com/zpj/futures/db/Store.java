@@ -290,9 +290,35 @@ public class Store extends SQLiteOpenHelper {
             o.put("minute", scalar("SELECT COUNT(*) FROM kline WHERE period='1m'"));
             o.put("daily", scalar("SELECT COUNT(*) FROM kline WHERE period='1d'"));
             o.put("forecasts", scalar("SELECT COUNT(*) FROM forecasts"));
+            o.put("periods", periodStats());
         } catch (Exception ignored) {
         }
         return o;
+    }
+
+    /** 各周期根数与最早一根的时间：{ "60m": {"n":1023,"from":1700000000000}, ... } */
+    public JSONObject periodStats() {
+        JSONObject o = new JSONObject();
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT period, COUNT(*), MIN(ts) FROM kline GROUP BY period", null);
+        try {
+            while (c.moveToNext()) {
+                JSONObject it = new JSONObject();
+                it.put("n", c.getInt(1));
+                it.put("from", c.getLong(2));
+                o.put(c.getString(0), it);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            c.close();
+        }
+        return o;
+    }
+
+    /** 删除某个周期全部 K 线（预置库重建时用）。 */
+    public int clearKline(String period) {
+        return getWritableDatabase().delete("kline", "period=?",
+                new String[]{period});
     }
 
     private int scalar(String sql) {

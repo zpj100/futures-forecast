@@ -76,12 +76,40 @@ public class Cfg {
         sp.edit().putString(K_GITEE, seal(safe(v))).apply();
     }
 
+    /** 界面风格：dark（默认黑夜） / light（白天）。 */
+    public String theme() {
+        String v = sp.getString("theme", "");
+        return "light".equals(v) ? "light" : "dark";
+    }
+
+    public void setTheme(String v) {
+        sp.edit().putString("theme", "light".equals(v) ? "light" : "dark").apply();
+    }
+
     public int activeProduct() {
         return sp.getInt("active_product", 0);
     }
 
     public void setActiveProduct(int i) {
         sp.edit().putInt("active_product", i).apply();
+    }
+
+    /** 已导入的预置行情库版本（assets/seed.db 的 seed_meta.version）。 */
+    public int seedVersion() {
+        return sp.getInt("seed_version", 0);
+    }
+
+    public void setSeedVersion(int v) {
+        sp.edit().putInt("seed_version", v).apply();
+    }
+
+    /** 最近一次历史同步的时间戳。 */
+    public long lastSync() {
+        return sp.getLong("last_sync", 0L);
+    }
+
+    public void setLastSync(long ms) {
+        sp.edit().putLong("last_sync", ms).apply();
     }
 
     private static String safe(String v) {

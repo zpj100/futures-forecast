@@ -85,9 +85,10 @@ public class Bridge {
     public String kline(String code, String period, int limit) {
         JSONObject o = new JSONObject();
         try {
+            String p = period == null || period.isEmpty() ? "1m" : period;
             JSONArray arr = new JSONArray();
-            List<Bar> bars = engine.bars(code, period);
-            if (bars.isEmpty()) bars = store.klines(code, period, limit);
+            List<Bar> bars = engine.bars(code, p);
+            if (bars.isEmpty()) bars = store.klines(code, p, limit);
             int from = Math.max(0, bars.size() - limit);
             for (int i = from; i < bars.size(); i++) {
                 Bar b = bars.get(i);
@@ -101,7 +102,7 @@ public class Bridge {
                 arr.put(row);
             }
             o.put("code", code);
-            o.put("period", period);
+            o.put("period", p);
             o.put("bars", arr);
         } catch (Exception ignored) {
         }
@@ -134,6 +135,20 @@ public class Bridge {
         emit("onToast", q("预测记录已清空"));
     }
 
+    /** 同步最近 180 天历史（日线 + 各周期分钟线）。 */
+    @JavascriptInterface
+    public void syncHistory() {
+        if (engine.isSyncing()) {
+            emit("onToast", q("同步正在进行中，请稍候"));
+            return;
+        }
+        emit("onToast", q("开始同步最近 180 天数据…"));
+        pool.execute(() -> {
+            JSONObject res = engine.syncHistory(msg -> emit("onSyncStep", q(msg)));
+            emit("onSync", res.toString());
+        });
+    }
+
     private static double round(double v) {
         return Math.round(v * 10000.0) / 10000.0;
     }
@@ -151,6 +166,7 @@ public class Bridge {
             o.put("llm_key_mask", mask(cfg.llmKey()));
             o.put("has_gitee_token", !cfg.giteeToken().isEmpty());
             o.put("gitee_token_mask", mask(cfg.giteeToken()));
+            o.put("theme", cfg.theme());
             o.put("version", BuildConfig.VERSION_NAME);
             o.put("version_code", BuildConfig.VERSION_CODE);
         } catch (Exception ignored) {
@@ -183,6 +199,10 @@ public class Bridge {
             String gt = o.optString("gitee_token", "");
             if ("clear".equals(gt)) cfg.setGiteeToken("");
             else if (!gt.isEmpty()) cfg.setGiteeToken(gt);
+            if (o.has("theme")) {
+                cfg.setTheme(o.optString("theme"));
+                applyNativeTheme();
+            }
             res.put("ok", true);
             res.put("message", "已保存");
         } catch (Exception e) {
@@ -193,6 +213,21 @@ public class Bridge {
             }
         }
         return res.toString();
+    }
+
+    // ---------------- 主题 ----------------
+
+    /** 前端切换主题时调用：写盘 + 同步原生底色与状态栏图标。 */
+    @JavascriptInterface
+    public void setTheme(String t) {
+        cfg.setTheme(t);
+        applyNativeTheme();
+    }
+
+    private void applyNativeTheme() {
+        if (ctx instanceof MainActivity) {
+            main.post(() -> ((MainActivity) ctx).applyThemeUi());
+        }
     }
 
     // ---------------- 大模型 ----------------

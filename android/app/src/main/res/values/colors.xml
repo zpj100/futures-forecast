@@ -1,8 +1,10 @@
 <resources>
     <color name="bg">#06080D</color>
     <color name="bg_soft">#0D1119</color>
+    <color name="bg_light">#F2F5F9</color>
     <color name="accent">#F6465D</color>
     <color name="accent_dark">#B3253A</color>
     <color name="text">#E6E8EC</color>
     <color name="text_dim">#8A919F</color>
+    <color name="icon_bg">#0B1220</color>
 </resources>

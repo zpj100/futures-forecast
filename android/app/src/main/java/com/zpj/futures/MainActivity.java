@@ -1,8 +1,10 @@
 package com.zpj.futures;
 
 import android.annotation.SuppressLint;
+import android.os.Build;
 import android.os.Bundle;
 import android.view.KeyEvent;
+import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
@@ -21,10 +23,14 @@ import com.zpj.futures.data.Engine;
  */
 public class MainActivity extends AppCompatActivity {
 
+    private static final int BG_DARK = 0xFF05070C;
+    private static final int BG_LIGHT = 0xFFF2F5F9;
+
     private WebView webView;
     private Engine engine;
     private Bridge bridge;
     private Cfg cfg;
+    private FrameLayout root;
     private long lastBackPress = 0L;
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -33,11 +39,11 @@ public class MainActivity extends AppCompatActivity {
         super.onCreate(savedInstanceState);
         cfg = new Cfg(this);
 
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF05070C);
+        root = new FrameLayout(this);
+        root.setBackgroundColor(BG_DARK);
 
         webView = new WebView(this);
-        webView.setBackgroundColor(0xFF05070C);
+        webView.setBackgroundColor(BG_DARK);
         root.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         setContentView(root);
@@ -60,6 +66,12 @@ public class MainActivity extends AppCompatActivity {
         webView.setWebViewClient(new WebViewClient());
 
         engine = new Engine(this, cfg);
+        // 首次安装或预置库版本更新时，把 APK 内置的分钟线 / 日线导入本地库
+        try {
+            com.zpj.futures.db.SeedImporter.importIfNeeded(
+                    this, cfg, com.zpj.futures.db.Store.get(this));
+        } catch (Exception ignored) {
+        }
         bridge = new Bridge(this, cfg, engine);
         bridge.attach(webView);
         engine.setListener(() -> {
@@ -71,7 +83,35 @@ public class MainActivity extends AppCompatActivity {
         webView.addJavascriptInterface(bridge, "Native");
 
         webView.loadUrl("file:///android_asset/index.html");
+        applyThemeUi();
         engine.start();
+    }
+
+    /** 按当前主题设置原生底色、状态栏与导航栏，避免切换时闪黑。 */
+    public void applyThemeUi() {
+        boolean light = "light".equals(cfg.theme());
+        int bg = light ? BG_LIGHT : BG_DARK;
+        if (root != null) root.setBackgroundColor(bg);
+        if (webView != null) webView.setBackgroundColor(bg);
+        try {
+            getWindow().setStatusBarColor(bg);
+            getWindow().setNavigationBarColor(bg);
+            View decor = getWindow().getDecorView();
+            int flags = decor.getSystemUiVisibility();
+            if (light) {
+                flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    flags |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                }
+            } else {
+                flags &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    flags &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                }
+            }
+            decor.setSystemUiVisibility(flags);
+        } catch (Exception ignored) {
+        }
     }
 
     @Override

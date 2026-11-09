@@ -26,3 +26,6 @@ android/local.properties
 # 预览/截图临时目录
 .preview/
 .cprofile/
+
+# 预置行情库（随 APK 分发，需入库）
+!android/app/src/main/assets/seed.db

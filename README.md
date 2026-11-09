@@ -1,8 +1,15 @@
-# 铝期货趋势预测 · futures-forecast
+# 学记期货 · futures-forecast
 
-实时采集 **电解铝（沪铝主力 AL0）**、**氧化铝（沪氧化铝主力 AO0）**、**伦铝（LME 3M AHD）**
-三个品种的公开行情，做六周期（1分钟 / 5分钟 / 10分钟 / 1小时 / 8小时 / 1天）方向预测，
-并把实时曲线、量化指标、趋势建议和财经资讯汇总在一个仪表盘里。
+手机 App（学记期货）＋ Python 研究后端两件套。
+
+App 端**完全独立运行**：直连新浪公开行情，把秒级快照、分钟线、日线落进手机 SQLite，
+在本地算指标与六周期方向，界面为移动优先的深色/白天双配色，带预测留档与命中率统计，
+并可从私有仓库自助更新、可选接入 DeepSeek 等大模型做独立分析。
+
+后端是本仓库的量化研究工具（岭回归 + 前向验证），用于回测与调参，App 不依赖它。
+
+下面三个品种的实时采集与六周期（1分钟 / 5分钟 / 10分钟 / 1小时 / 8小时 / 1天）方向预测逻辑两端同源：
+**电解铝（沪铝主力 AL0）**、**氧化铝（沪氧化铝主力 AO0）**、**伦铝（LME 3M AHD）**。
 
 数据全部来自公开接口，无需任何 API Key。
 
@@ -99,44 +106,66 @@ futures-forecast/
 └── README.md
 ```
 
-## 七、Android APK
+## 七、Android App（学记期货）
 
-APK 是一个 WebView 壳，加载局域网内的后端地址，本身不含数据。
+2.0 起 APK 不再依赖电脑：采集、存储、指标、预测全部在手机内完成，装完即用。
+
+| 项 | 说明 |
+|---|---|
+| 应用名 | 学记期货（图标为深色底 + 白色方框，框内双行小字） |
+| 数据 | Java 直连新浪公开行情，秒级快照 / 分钟线 / 日线写入手机 SQLite |
+| 预置数据 | APK 内置 `assets/seed.db`：约 1.9 万根真实 K 线（日线 2005 起、分钟线 1/5/15/30/60 分钟），首装即有线可看 |
+| 刷新 | 默认 30 秒，可切 5 秒 / 10 秒 / 30 秒 / 1 分钟 / 5 分钟，另有手动刷新 |
+| 界面 | 底部四标签（行情 / 预测 / 历史 / 设置）；行情页三品种一屏并排；**黑夜 / 白天**双配色 |
+| 预测 | 每次预测落库，到期自动回填实际价并统计方向命中率 |
+| 大模型 | 默认 DeepSeek，可切任意 OpenAI 兼容端点，Key 用 AndroidKeyStore 加密存本机 |
 
 ```bash
-# 构建（首次需联网下载 Gradle 依赖，之后可离线）
+# 构建（WSL Debian + JDK 21 + Gradle 8.9 + SDK 34）
+python3 scripts/build_seed.py      # 可选：重新抓一份预置行情（约 1.5 MB）
 bash android/build-apk.sh
 ```
 
-产物：`releases/futures-forecast-v1.0.0.apk`（约 2.3 MB，已签名）
+### 历史数据与同步
 
-使用步骤：
+发版前用 `scripts/build_seed.py` 抓一份真实行情打进包里（不做任何合成）：
 
-1. 电脑上 `bash run.sh` 启动后端，记下电脑局域网 IP（如 `192.168.1.10`）
-2. 手机安装 APK，首次打开会弹出「服务器地址」对话框
-3. 填 `http://192.168.1.10:8000`，保存即可
-4. 之后点击右下角齿轮可随时修改地址
+| 周期 | 根数（每品种） | 覆盖范围 |
+|------|---------------|----------|
+| 日线 | 沪铝 5313 / 氧化铝 821 / 伦铝 2537 | 2005 / 2023 / 2016 至今 |
+| 60 分钟 | 1023 | 约 195 天（可覆盖「最近 180 天」） |
+| 30 / 15 / 5 / 1 分钟 | 各 1023 | 100 / 56 / 17 / 4 天 |
 
-手机与电脑需在同一局域网。服务用 HTTPS 暴露到公网时也可直接填公网地址。
+设置页「同步历史数据」会重新拉取：日线近 180 天 + 各周期分钟线，写入本地库并刷新曲线。
+源站每周期最多返回 1023 根，因此 1 分钟线只能覆盖最近几个交易日；**秒级点公开接口不提供历史，
+只能由 App 运行时累积**（保留 30 天），预置包里不含伪造的秒级数据。
 
-## 八、自动更新
+产物：`releases/futures-forecast-v2.1.0.apk`（约 2.4 MB，已签名，minSdk 24）
 
-`release/version.json` 是客户端读取的版本清单：
+装好后无需任何配置即可看到行情；要大模型分析就在「设置」填 API Key，
+要 App 内自助更新就在「设置」填 Gitee 个人令牌。
+
+## 八、版本与自动更新
+
+版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.1.0 → 210），Release 正文首行标注 `versionCode: 210`。
+
+App 内「设置 → 应用更新」会带令牌读取本仓库 `releases/latest`，比较 `versionCode` 后下载并调起安装。
+私有仓库读取与下载都需要令牌，令牌只存手机端（AndroidKeyStore 加密），不上传任何服务器。
+
+`release/version.json` 保留为可读的版本清单，便于脚本或第三方读取：
 
 ```json
 {
-  "version": "1.0.0",
-  "versionCode": 1,
+  "version": "2.1.0",
+  "versionCode": 210,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
-  "mirror": "https://github.com/zpj100/futures-forecast/releases/latest",
-  "notes": "首个版本：三品种实时行情、六周期趋势预测、量化指标、资讯聚合与 Web 仪表盘。"
+  "notes": "…"
 }
 ```
 
-APK 启动后拉取 Gitee 上的 `release/version.json`，`versionCode` 大于本地值时弹窗提示更新，点击跳转 Release 页。
-仓库同时镜像到 GitHub，Gitee 不可达时可手动从 GitHub下载。
-
-发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName` → 构建 → 同步更新 `release/version.json` → 打 Gitee Release 并上传 APK。
+发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName`
+→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.1.0`）
+→ 创建 Gitee Release 并上传 APK → `python3 scripts/delete_asset.py` 可清理旧附件。
 
 ## 九、免责声明
 

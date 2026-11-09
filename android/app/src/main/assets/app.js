@@ -1,4 +1,4 @@
-/* 铝期货 · 趋势预测 2.0 —— 手机端单页应用
+/* 学记期货 · 趋势预测 2.1 —— 手机端单页应用
    数据来自本机 Native 桥（Java 采集 + SQLite），无外部后端依赖。 */
 (function () {
   'use strict';
@@ -6,6 +6,8 @@
   var N = window.Native || null;
   var $ = function (s) { return document.querySelector(s); };
   var DEMO = !N;
+  // 调试/预览用：?theme=dark|light 可强制配色（正常启动不会命中）
+  var FORCED = (location.search.match(/[?&]theme=(dark|light)/) || [])[1] || '';
 
   var S = {
     state: null,
@@ -22,6 +24,7 @@
     { k: '1m', label: '1分', step: 1 },
     { k: '5m', label: '5分', step: 5 },
     { k: '15m', label: '15分', step: 15 },
+    { k: '30m', label: '30分', step: 30 },
     { k: '60m', label: '60分', step: 60 },
     { k: '1d', label: '日线', step: 0 }
   ];
@@ -33,6 +36,33 @@
     { v: 60, label: '1分钟' },
     { v: 300, label: '5分钟' }
   ];
+
+  var THEMES = [
+    { v: 'dark', label: '黑夜' },
+    { v: 'light', label: '白天' }
+  ];
+
+  // ---------------- 主题 ----------------
+
+  function isLight() {
+    return document.documentElement.classList.contains('light');
+  }
+
+  /** 应用配色。notify=true 时同时写盘并同步原生底色/状态栏。 */
+  function applyTheme(t, notify) {
+    var light = t === 'light';
+    document.documentElement.classList.toggle('light', light);
+    var meta = document.getElementById('themeColor');
+    if (meta) meta.setAttribute('content', light ? '#EEF2F7' : '#05070C');
+    if (notify && N && N.setTheme) {
+      try { N.setTheme(t); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function upColor() { return isLight() ? '#d92d20' : '#f6465d'; }
+  function downColor() { return isLight() ? '#0e8f52' : '#2ebd85'; }
+  function upRGB() { return isLight() ? '217,45,32' : '246,70,93'; }
+  function downRGB() { return isLight() ? '14,143,82' : '46,189,133'; }
 
   // ---------------- 工具 ----------------
 
@@ -66,6 +96,13 @@
     var d = new Date();
     var p = function (n) { return n < 10 ? '0' + n : '' + n; };
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  function dateStr(ms) {
+    if (!ms) return '—';
+    var d = new Date(ms);
+    var p = function (n) { return n < 10 ? '0' + n : '' + n; };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
   }
 
   function toast(msg) {
@@ -175,7 +212,7 @@
       var y = h - 3 - ((p[1] - min) / span) * (h - 6);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
-    ctx.strokeStyle = up ? 'rgba(246,70,93,.95)' : 'rgba(46,189,133,.95)';
+    ctx.strokeStyle = up ? upColor() : downColor();
     ctx.lineWidth = 1.4;
     ctx.stroke();
   }
@@ -184,20 +221,34 @@
     var canvas = $('#chart');
     var empty = $('#chartEmpty');
     var period = PERIODS.filter(function (p) { return p.k === S.period; })[0] || PERIODS[0];
-    var raw = [];
+    var raw = null;
+    var bars = [];
     try {
       raw = JSON.parse(DEMO
         ? JSON.stringify(demoBars(S.code, period.step))
-        : N.kline(S.code, S.period === '1d' ? '1d' : '1m', 900));
-    } catch (e) { raw = { bars: [] }; }
+        : N.kline(S.code, period.k, period.k === '1d' ? 4000 : 1400));
+      bars = (raw && raw.bars) || [];
+    } catch (e) { bars = []; }
 
-    var bars = (raw && raw.bars) || [];
-    if (period.step > 1) bars = aggregate(bars, period.step);
-    bars = bars.slice(-180);
+    // 该周期没有独立数据时，用 1 分钟线现场聚合兜底
+    if (bars.length < 2 && !DEMO && period.step > 1) {
+      try {
+        var one = JSON.parse(N.kline(S.code, '1m', 1400));
+        bars = aggregate((one && one.bars) || [], period.step);
+      } catch (e) { bars = []; }
+    }
+
+    var limit = (period.k === '60m' || period.k === '1d') ? 1100 : 260;
+    bars = bars.slice(-limit);
 
     var meta = $('#chartMeta');
     if (meta) {
-      meta.textContent = bars.length ? bars.length + ' 根 · ' + period.label : '—';
+      if (!bars.length) meta.textContent = '—';
+      else {
+        var span = Math.round((bars[bars.length - 1][0] - bars[0][0]) / 86400000);
+        meta.textContent = bars.length + ' 根 · ' + period.label
+          + ' · ' + dateStr(bars[0][0]) + (span > 0 ? '（' + span + ' 天）' : '');
+      }
     }
     if (bars.length < 2) {
       empty.style.display = 'grid';
@@ -231,7 +282,8 @@
 
   function drawLine(canvas, bars) {
     var w = canvas.clientWidth || 320;
-    var h = 210;
+    var h = canvas.clientHeight || 178;
+    var light = isLight();
     var dpr = window.devicePixelRatio || 1;
     canvas.width = w * dpr;
     canvas.height = h * dpr;
@@ -239,7 +291,7 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
 
-    var padL = 6, padR = 52, padT = 14, padB = 18;
+    var padL = 6, padR = 52, padT = 12, padB = 16;
     var closes = bars.map(function (b) { return b[4]; });
     var min = Math.min.apply(null, closes), max = Math.max.apply(null, closes);
     var span = max - min || Math.max(max * 0.002, 0.01);
@@ -250,7 +302,7 @@
     var Y = function (v) { return padT + (1 - (v - min) / span) * (h - padT - padB); };
 
     // 网格
-    ctx.strokeStyle = 'rgba(120,200,255,.07)';
+    ctx.strokeStyle = light ? 'rgba(15,60,110,.10)' : 'rgba(120,200,255,.07)';
     ctx.lineWidth = 1;
     for (var g = 0; g <= 3; g++) {
       var gy = padT + (g / 3) * (h - padT - padB);
@@ -259,15 +311,15 @@
       ctx.lineTo(w - padR, gy);
       ctx.stroke();
       var gv = max - (g / 3) * span;
-      ctx.fillStyle = 'rgba(124,135,152,.75)';
+      ctx.fillStyle = light ? 'rgba(70,90,115,.88)' : 'rgba(124,135,152,.75)';
       ctx.font = '10px ui-monospace, monospace';
       ctx.textAlign = 'left';
       ctx.fillText(gv.toFixed(max > 1000 ? 0 : 2), w - padR + 6, gy + 3);
     }
 
     var up = closes[closes.length - 1] >= closes[0];
-    var lineColor = up ? '#f6465d' : '#2ebd85';
-    var rgb = up ? '246,70,93' : '46,189,133';
+    var lineColor = up ? upColor() : downColor();
+    var rgb = up ? upRGB() : downRGB();
 
     // 填充
     var grad = ctx.createLinearGradient(0, padT, 0, h - padB);
@@ -308,7 +360,7 @@
     // 现价标签
     ctx.fillStyle = lineColor;
     ctx.fillRect(w - padR + 2, ly - 8, padR - 4, 16);
-    ctx.fillStyle = '#05070c';
+    ctx.fillStyle = isLight() ? '#ffffff' : '#05070c';
     ctx.font = 'bold 10px ui-monospace, monospace';
     ctx.textAlign = 'center';
     ctx.fillText(closes[closes.length - 1].toFixed(max > 1000 ? 0 : 2), w - padR / 2, ly + 3.5);
@@ -401,9 +453,19 @@
     }
     var ds = $('#dataStats');
     if (ds) {
+      var pr = st.periods || {};
+      var n = function (k) { return (pr[k] && pr[k].n) || 0; };
       ds.innerHTML = statCell('秒级点', st.ticks || 0)
-        + statCell('分钟线', st.minute || 0)
+        + statCell('日线', n('1d') || st.daily || 0)
+        + statCell('60分钟', n('60m'))
         + statCell('预测条', st.forecasts || 0);
+    }
+    if (S.state && S.state.last_sync) {
+      var info = $('#syncInfo');
+      if (info && info.getAttribute('data-busy') !== '1') {
+        info.textContent = '上次同步 ' + timeStr(S.state.last_sync)
+          + '。源站每周期最多 1023 根，60 分钟线约覆盖 195 天。';
+      }
     }
   }
 
@@ -464,16 +526,44 @@
   function loadSettings() {
     var s = {};
     try {
-      s = JSON.parse(DEMO ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"version":"2.0.0"}' : N.settings());
+      s = JSON.parse(DEMO
+        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.1.0"}'
+        : N.settings());
     } catch (e) { s = {}; }
     S.settings = s;
+    if (!S.settings.theme) S.settings.theme = isLight() ? 'light' : 'dark';
+    if (FORCED) S.settings.theme = FORCED;
+    applyTheme(S.settings.theme, false);
     $('#llmBase').value = s.llm_base || '';
     $('#llmModel').value = s.llm_model || '';
     $('#llmMask').textContent = s.has_llm_key ? s.llm_key_mask : '未配置';
     $('#gtMask').textContent = s.has_gitee_token ? s.gitee_token_mask : '未配置';
     $('#aboutVer').textContent = s.version || '—';
-    $('#brandVer').textContent = 'v' + (s.version || '2.0');
+    $('#brandVer').textContent = 'v' + (s.version || '2.1');
     renderIntervalChips();
+    renderThemeChips();
+  }
+
+  function renderThemeChips() {
+    var cur = (S.settings && S.settings.theme) || 'dark';
+    var box = $('#themeChips');
+    box.innerHTML = THEMES.map(function (t) {
+      return '<button class="chip' + (t.v === cur ? ' on' : '') + '" data-theme="' + t.v + '">'
+        + t.label + '</button>';
+    }).join('');
+    Array.prototype.forEach.call(box.querySelectorAll('.chip'), function (b) {
+      b.addEventListener('click', function () {
+        var v = b.getAttribute('data-theme');
+        if (v === S.settings.theme) return;
+        S.settings.theme = v;
+        applyTheme(v, true);
+        renderThemeChips();
+        // 重绘画布，让网格与现价标签跟随配色
+        renderQuotes();
+        renderChart();
+        toast(v === 'light' ? '已切换为白天模式' : '已切换为黑夜模式');
+      });
+    });
   }
 
   function renderIntervalChips() {
@@ -566,6 +656,33 @@
   }
 
   // ---------------- 更新 ----------------
+
+  function onSyncStep(msg) {
+    var info = $('#syncInfo');
+    if (info) info.textContent = msg;
+  }
+
+  function onSync(res) {
+    var b = $('#btnSyncHistory');
+    if (b) {
+      b.disabled = false;
+      b.textContent = '同步历史数据';
+    }
+    var info = $('#syncInfo');
+    if (info) info.removeAttribute('data-busy');
+    if (!res || !res.ok) {
+      var m = (res && res.message) || '同步失败';
+      if (info) info.textContent = m;
+      toast(m);
+      return;
+    }
+    if (info) {
+      info.textContent = '同步完成：' + res.message
+        + (res.warn ? '\n' + res.warn : '');
+    }
+    toast('同步完成：' + res.message);
+    pull();
+  }
 
   function checkUpdate() {
     var info = $('#updInfo');
@@ -687,8 +804,25 @@
       if (DEMO) { toast('演示模式不支持安装'); return; }
       try { N.installUpdate(o.apk_url, o.version); } catch (e) { toast('下载失败'); }
     });
-    $('#btnClearFc').addEventListener('click', function () {
-      if (!confirm('确定清空全部预测记录？预测命中率统计会一起重置。')) return;
+    // 同步历史数据（最近 180 天）
+    $('#btnSyncHistory').addEventListener('click', function () {
+      if (DEMO) { toast('演示模式不支持同步'); return; }
+      var b = this;
+      b.disabled = true;
+      b.textContent = '同步中…';
+      var info = $('#syncInfo');
+      if (info) {
+        info.setAttribute('data-busy', '1');
+        info.textContent = '正在同步最近 180 天数据…';
+      }
+      try { N.syncHistory(); } catch (e) {
+        b.disabled = false;
+        b.textContent = '同步历史数据';
+        toast('同步失败：' + e.message);
+      }
+    });
+
+    $('#btnClearFc').addEventListener('click', function () {      if (!confirm('确定清空全部预测记录？预测命中率统计会一起重置。')) return;
       if (DEMO) { toast('演示模式'); return; }
       try { N.clearForecasts(); } catch (e) { /* ignore */ }
       S.state = S.state || {};
@@ -718,6 +852,8 @@
     onData: function () { pull(); },
     onLlm: function (res) { onLlm(res); },
     onUpdate: function (o) { onUpdate(o); },
+    onSync: function (res) { onSync(res); },
+    onSyncStep: function (msg) { onSyncStep(msg); },
     onToast: function (msg) { toast(msg); }
   };
 
@@ -741,7 +877,18 @@
                  mk('AHD', '伦铝', '伦铝（LME 3M）', '美元/吨', 2612, 0.31)],
       last_tick: Date.now(), last_error: '',
       refresh_sec: 30,
-      stats: { ticks: 8462, minute: 3072, daily: 14400, forecasts: 96 }
+      last_sync: Date.now() - 3 * 3600_000,
+      stats: {
+        ticks: 8462, minute: 1023, daily: 5313, forecasts: 96,
+        periods: {
+          '1m': { n: 1023, from: Date.now() - 4 * 86400_000 },
+          '5m': { n: 1023, from: Date.now() - 17 * 86400_000 },
+          '15m': { n: 1023, from: Date.now() - 56 * 86400_000 },
+          '30m': { n: 1023, from: Date.now() - 100 * 86400_000 },
+          '60m': { n: 1023, from: Date.now() - 195 * 86400_000 },
+          '1d': { n: 5313, from: Date.now() - 7500 * 86400_000 }
+        }
+      }
     };
   }
 
