@@ -193,6 +193,8 @@ def main():
     db.commit()
     db.execute("VACUUM")
     db.close()
+    # 小体积版本号旁文件：App 启动时先读它比对版本，命中就不再拷贝 1.5MB 的 seed.db
+    (out.parent / "seed_ver.txt").write_text(str(meta["version"]), encoding="utf-8")
     size = out.stat().st_size
     print(f"\n==> {out}  {size/1048576:.2f} MB, {total} 行, version={meta['version']}")
     return 0

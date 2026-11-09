@@ -455,16 +455,17 @@
     if (ds) {
       var pr = st.periods || {};
       var n = function (k) { return (pr[k] && pr[k].n) || 0; };
-      ds.innerHTML = statCell('秒级点', st.ticks || 0)
-        + statCell('日线', n('1d') || st.daily || 0)
+      ds.innerHTML = statCell('日线', n('1d') || st.daily || 0)
         + statCell('60分钟', n('60m'))
+        + statCell('1分钟', n('1m') || st.minute || 0)
         + statCell('预测条', st.forecasts || 0);
     }
-    if (S.state && S.state.last_sync) {
+    if (S.state && (S.state.last_sync || S.state.last_sync_msg)) {
       var info = $('#syncInfo');
       if (info && info.getAttribute('data-busy') !== '1') {
-        info.textContent = '上次同步 ' + timeStr(S.state.last_sync)
-          + '。源站每周期最多 1023 根，60 分钟线约覆盖 195 天。';
+        info.textContent = (S.state.last_sync ? '上次同步 ' + timeStr(S.state.last_sync) : '尚未同步')
+          + (S.state.last_sync_msg ? '：' + S.state.last_sync_msg : '')
+          + '。源站每周期最多 1023 根（60 分钟线约 195 天），重复同步只补增量。';
       }
     }
   }

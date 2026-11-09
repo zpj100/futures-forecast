@@ -160,6 +160,11 @@ public class Store extends SQLiteOpenHelper {
         }
     }
 
+    /** kline 表总行数（判断预置库是否需要导入）。 */
+    public int countKlineAll() {
+        return scalar("SELECT COUNT(*) FROM kline");
+    }
+
     // ---------------- forecasts ----------------
 
     public long addForecast(String code, String horizon, String dir, double pUp,

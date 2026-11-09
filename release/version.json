@@ -1,7 +1,7 @@
 {
-  "version": "2.1.1",
-  "versionCode": 211,
+  "version": "2.1.2",
+  "versionCode": 212,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.1.1：修复应用内更新下载 HTTP 403——Gitee 私有仓库的发行版直链需要浏览器登录态，改为走附件 API 下载并手动跟随 303 跳转；更新源固定为 Gitee（首要源），令牌失效/无权限给出明确提示。"
+  "notes": "v2.1.2：修复预置历史库从未导入——seed_meta.version 是 12 位时间戳，旧代码用 Integer.parseInt 溢出抛异常被吞成 0，判定「无需导入」，导致装完没有任何本地K线、曲线一直等待数据；改为 long 解析 + 本地空库自愈导入 + 逐行写入兜底，并新增 seed_ver.txt 版本旁文件。同步历史数据改为与官方源增量合并（只写本地最后一根及之后的 bar），回显每周期新增与总量；本地空库时启动自动补一次。"
 }

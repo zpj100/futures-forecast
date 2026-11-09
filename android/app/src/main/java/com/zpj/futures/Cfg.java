@@ -94,13 +94,38 @@ public class Cfg {
         sp.edit().putInt("active_product", i).apply();
     }
 
-    /** 已导入的预置行情库版本（assets/seed.db 的 seed_meta.version）。 */
-    public int seedVersion() {
-        return sp.getInt("seed_version", 0);
+    /**
+     * 已导入的预置行情库版本（assets/seed.db 的 seed_meta.version，形如 202611092054）。
+     * 必须用 long：12 位时间戳版本号超出 int 范围，早期用 parseInt 会 NumberFormatException
+     * 被吞成 0，导致预置库永远不导入（v2.1.2 修复）。
+     */
+    public long seedVersion() {
+        Object v = sp.getAll().get("seed_version");
+        return v instanceof Number ? ((Number) v).longValue() : 0L;
     }
 
-    public void setSeedVersion(int v) {
-        sp.edit().putInt("seed_version", v).apply();
+    public void setSeedVersion(long v) {
+        sp.edit().putLong("seed_version", v).apply();
+    }
+
+    /** 预置库导入完成时间（0 表示从未导入）。 */
+    public long seedImportedAt() {
+        Object v = sp.getAll().get("seed_imported_at");
+        return v instanceof Number ? ((Number) v).longValue() : 0L;
+    }
+
+    public void setSeedImportedAt(long ms) {
+        sp.edit().putLong("seed_imported_at", ms).apply();
+    }
+
+    /** 最近一次历史同步的结果摘要，供设置页回显（排查“同步没反应”）。 */
+    public String lastSyncMsg() {
+        String v = sp.getString("last_sync_msg", "");
+        return v == null ? "" : v;
+    }
+
+    public void setLastSyncMsg(String v) {
+        sp.edit().putString("last_sync_msg", safe(v)).apply();
     }
 
     /** 最近一次历史同步的时间戳。 */

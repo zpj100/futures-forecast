@@ -136,18 +136,26 @@ bash android/build-apk.sh
 | 60 分钟 | 1023 | 约 195 天（可覆盖「最近 180 天」） |
 | 30 / 15 / 5 / 1 分钟 | 各 1023 | 100 / 56 / 17 / 4 天 |
 
-设置页「同步历史数据」会重新拉取：日线近 180 天 + 各周期分钟线，写入本地库并刷新曲线。
+设置页「同步历史数据」与官方源做**增量**合并：只把「本地最后一根及之后」的 bar 写库
+（boundary 那根会被替换刷新），重复点击不会重复写库，结果回显每周期「新增根数 + 本地总量」。
 源站每周期最多返回 1023 根，因此 1 分钟线只能覆盖最近几个交易日；**秒级点公开接口不提供历史，
 只能由 App 运行时累积**（保留 30 天），预置包里不含伪造的秒级数据。
 
-产物：`releases/futures-forecast-v2.1.1.apk`（约 3.0 MB，已签名，minSdk 24）
+> **预置库导入的两个坑（v2.1.2 修复）**
+> 1. `seed_meta.version` 是 12 位时间戳（`202611092054`），旧代码用 `Integer.parseInt` 解析必然
+>    `NumberFormatException`，被 catch 成 0 后直接判定「无需导入」——1.9 万根 K 线从未进过手机库，
+>    于是装完曲线一直「等待数据」。现改为 **long 解析**。
+> 2. 首次导入失败后没有自愈：现在只要本地 `kline` 为空就强制导入一次（`INSERT OR IGNORE`，不覆盖新数据）；
+>    另加「ATTACH 失败则逐行写入」兜底与 `assets/seed_ver.txt` 版本旁文件（命中就不再拷贝 1.5MB）。
+
+产物：`releases/futures-forecast-v2.1.2.apk`（约 3.0 MB，已签名，minSdk 24）
 
 装好后无需任何配置即可看到行情；要大模型分析就在「设置」填 API Key，
 要 App 内自助更新就在「设置」填 Gitee 个人令牌。
 
 ## 八、版本与自动更新
 
-版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.1.1 → 211），Release 正文首行标注 `versionCode: 211`。
+版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.1.2 → 212），Release 正文首行标注 `versionCode: 212`。
 
 **更新源固定为 Gitee（首要源）**：App 内「设置 → 应用更新」带令牌读取本仓库 `releases/latest`，
 比较 `versionCode` 后下载并调起安装。令牌只存手机端（AndroidKeyStore 加密），不上传任何服务器。
@@ -169,16 +177,16 @@ bash android/build-apk.sh
 
 ```json
 {
-  "version": "2.1.1",
-  "versionCode": 211,
+  "version": "2.1.2",
+  "versionCode": 212,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "notes": "…"
 }
 ```
 
 发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName`
-→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.1.1`）
-→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 211`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
+→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.1.2`）
+→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 212`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
 
 ## 九、免责声明
 
