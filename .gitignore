@@ -22,3 +22,7 @@ android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
+
+# 预览/截图临时目录
+.preview/
+.cprofile/

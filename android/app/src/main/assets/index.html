@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#05070C">
+<title>铝期货 · 趋势预测</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+
+  <header class="hdr">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <b>AL · FUTURES</b>
+      <i id="brandVer">v2</i>
+    </div>
+    <div class="hdr-right">
+      <span id="live" class="live"><span class="live-dot"></span>初始化</span>
+      <button id="btnRefresh" class="icon-btn" aria-label="刷新数据">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 5V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z" fill="currentColor"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ============ 行情 ============ -->
+    <section class="view active" id="v-market">
+      <div class="cards" id="quoteCards"></div>
+
+      <div class="panel">
+        <div class="chips" id="prodChips"></div>
+        <div class="chart-wrap">
+          <canvas id="chart"></canvas>
+          <div class="chart-empty" id="chartEmpty">等待数据…</div>
+        </div>
+        <div class="row-between chart-foot">
+          <div class="chips small" id="periodChips"></div>
+          <span class="muted" id="chartMeta">—</span>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">技术指标 <span id="indBias" class="tag">—</span></div>
+        <div class="ind-grid" id="indGrid"></div>
+      </div>
+    </section>
+
+    <!-- ============ 预测 ============ -->
+    <section class="view" id="v-forecast">
+      <div class="hero" id="hero">
+        <div class="hero-label">综合结论</div>
+        <div class="hero-main" id="heroMain">—</div>
+        <div class="hero-meter"><div class="hero-meter-fill" id="heroFill"></div></div>
+        <div class="hero-sub">
+          <span id="heroScore">评分 —</span>
+          <span id="heroPrice">—</span>
+        </div>
+        <div class="hero-rec" id="heroRec">—</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">六周期方向</div>
+        <div class="hz-grid" id="hzGrid"></div>
+      </div>
+
+      <div class="panel">
+        <div class="row-between">
+          <div class="panel-title">大模型分析</div>
+          <button id="btnLlm" class="btn ghost">生成分析</button>
+        </div>
+        <div id="llmBox" class="llm">
+          <div class="muted">在「设置」填写模型 API Key 后，可让大模型结合当前指标与曲线给出独立判断。</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 历史 ============ -->
+    <section class="view" id="v-history">
+      <div class="stat-row" id="statRow"></div>
+      <div class="chips" id="histChips"></div>
+      <div id="histList" class="hist-list"></div>
+    </section>
+
+    <!-- ============ 设置 ============ -->
+    <section class="view" id="v-settings">
+
+      <div class="panel">
+        <div class="panel-title">数据刷新</div>
+        <div class="field-label">自动刷新间隔（后台持续采集）</div>
+        <div class="chips" id="intervalChips"></div>
+        <div class="hint">曲线与预测保存在手机本地，断网也能查看历史。</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">大模型</div>
+        <div class="field-label">API 地址（OpenAI 兼容）</div>
+        <input id="llmBase" class="input" placeholder="https://api.deepseek.com/v1" autocapitalize="off" spellcheck="false">
+        <div class="field-label">模型名称</div>
+        <input id="llmModel" class="input" placeholder="deepseek-chat" autocapitalize="off" spellcheck="false">
+        <div class="field-label">API Key <span id="llmMask" class="muted"></span></div>
+        <input id="llmKey" class="input" type="password" placeholder="留空表示不修改" autocapitalize="off" spellcheck="false">
+        <div class="row-btns">
+          <button class="btn ghost" id="btnLlmClear">清除 Key</button>
+          <button class="btn" id="btnLlmSave">保存</button>
+        </div>
+        <div class="hint">Key 仅存于本机，用系统密钥库加密，不会上传任何服务器。</div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">应用更新</div>
+        <div class="field-label">Gitee 个人令牌 <span id="gtMask" class="muted"></span></div>
+        <input id="giteeToken" class="input" type="password" placeholder="私有仓库发行版需要令牌" autocapitalize="off" spellcheck="false">
+        <div class="row-btns">
+          <button class="btn ghost" id="btnUpdateCheck">检查更新</button>
+          <button class="btn" id="btnUpdateInstall" disabled>立即更新</button>
+        </div>
+        <div class="upd-info" id="updInfo"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-title">本地数据</div>
+        <div class="stat-row tight" id="dataStats"></div>
+        <div class="row-btns">
+          <button class="btn ghost danger" id="btnClearFc">清空预测记录</button>
+        </div>
+      </div>
+
+      <div class="panel about">
+        <div class="about-row"><span>版本</span><b id="aboutVer">—</b></div>
+        <div class="about-row"><span>数据源</span><span>新浪公开行情</span></div>
+        <div class="about-row"><span>存储</span><span>手机本地 SQLite</span></div>
+        <p class="disclaimer">本应用为量化统计研究与可视化演示，所有预测与建议均不构成投资建议。期货交易有杠杆风险，请自行判断并控制仓位。</p>
+      </div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar">
+    <button class="tab active" data-tab="market">
+      <svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 3 5-7 4 4v7H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+      <span>行情</span>
+    </button>
+    <button class="tab" data-tab="forecast">
+      <svg viewBox="0 0 24 24"><path d="M12 3v3m0 12v3M3 12h3m12 0h3M6.3 6.3l2.1 2.1m7.2 7.2l2.1 2.1m0-11.4l-2.1 2.1M8.4 15.6l-2.1 2.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+      <span>预测</span>
+    </button>
+    <button class="tab" data-tab="history">
+      <svg viewBox="0 0 24 24"><path d="M4 5h16M4 12h16M4 19h10" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18.5" cy="19" r="1.6" fill="currentColor"/></svg>
+      <span>历史</span>
+    </button>
+    <button class="tab" data-tab="settings">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.6l1.4 2.2 2.6-.5 1 2.6 2.5 1-.7 2.6 1.7 2-1.7 2 .7 2.6-2.5 1-1 2.6-2.6-.5L12 21.4l-1.4-2.2-2.6.5-1-2.6-2.5-1 .7-2.6-1.7-2 1.7-2-.7-2.6 2.5-1 1-2.6 2.6.5z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+      <span>设置</span>
+    </button>
+  </nav>
+
+  <div class="toast" id="toast"></div>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

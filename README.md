@@ -127,16 +127,16 @@ bash android/build-apk.sh
 {
   "version": "1.0.0",
   "versionCode": 1,
-  "url": "https://github.com/zpj100/futures-forecast/releases/latest",
-  "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
+  "url": "https://gitee.com/zpj100/futures-forecast/releases",
+  "mirror": "https://github.com/zpj100/futures-forecast/releases/latest",
   "notes": "首个版本：三品种实时行情、六周期趋势预测、量化指标、资讯聚合与 Web 仪表盘。"
 }
 ```
 
-APK 启动后拉取 GitHub 上的 `release/version.json`，`versionCode` 大于本地值时弹窗提示更新，点击跳转 Release 页。
-仓库同时镜像到 Gitee，GitHub 不可达时可手动从 Gitee 下载。
+APK 启动后拉取 Gitee 上的 `release/version.json`，`versionCode` 大于本地值时弹窗提示更新，点击跳转 Release 页。
+仓库同时镜像到 GitHub，Gitee 不可达时可手动从 GitHub下载。
 
-发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName` → 构建 → 同步更新 `release/version.json` → 打 GitHub Release 并上传 APK。
+发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName` → 构建 → 同步更新 `release/version.json` → 打 Gitee Release 并上传 APK。
 
 ## 九、免责声明
 
