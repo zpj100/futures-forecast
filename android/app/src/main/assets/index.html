@@ -75,7 +75,18 @@
       </div>
 
       <div class="panel">
-        <div class="panel-title">七周期方向（量化模型）</div>
+        <div class="row-between">
+          <div class="panel-title">七周期方向（量化模型）</div>
+          <button id="btnPredict" class="btn ghost">更新预测</button>
+        </div>
+        <div class="prog-wrap" id="predProgWrap" hidden>
+          <div class="prog"><i id="predProgBar"></i></div>
+          <div class="prog-meta">
+            <span id="predProgText">准备刷新…</span>
+            <span id="predProgPct">0%</span>
+          </div>
+        </div>
+        <div class="hint" id="predInfo">整分钟自动更新短线四档（1/5/15/30 分钟），整点全量重算七档。</div>
         <div class="hz-grid" id="hzGrid"></div>
       </div>
 
@@ -138,6 +149,13 @@
           <button class="btn ghost" id="btnUpdateCheck">检查更新</button>
           <button class="btn" id="btnUpdateInstall" disabled>立即更新</button>
         </div>
+        <div class="prog-wrap" id="updProgWrap" hidden>
+          <div class="prog"><i id="updProgBar"></i></div>
+          <div class="prog-meta">
+            <span id="updProgText">准备下载…</span>
+            <span id="updProgPct">0%</span>
+          </div>
+        </div>
         <div class="upd-info" id="updInfo"></div>
       </div>
 
@@ -146,6 +164,13 @@
         <div class="stat-row tight two" id="dataStats"></div>
         <div class="row-btns">
           <button class="btn" id="btnSyncHistory">同步历史数据</button>
+        </div>
+        <div class="prog-wrap" id="syncProgWrap" hidden>
+          <div class="prog"><i id="syncProgBar"></i></div>
+          <div class="prog-meta">
+            <span id="syncProgText">准备同步…</span>
+            <span id="syncProgPct">0%</span>
+          </div>
         </div>
         <div class="hint" id="syncInfo">同步最近 180 天：日线 + 分钟线（源站每周期最多 1023 根，60 分钟线可覆盖约 195 天）。安装包内已预置一份，平常无需手动同步。</div>
         <div class="row-btns">

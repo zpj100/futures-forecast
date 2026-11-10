@@ -50,8 +50,14 @@ public class Engine {
 
     private volatile long lastTick = 0;
     private volatile long lastKline = 0;
+    private volatile long lastMinuteSync = 0;
+    private volatile long lastDailySync = 0;
+    private volatile long lastForecastAt = 0;
+    private volatile long nextForecastAt = 0;
     private volatile String lastError = "";
     private final AtomicBoolean busy = new AtomicBoolean(false);
+    private final AtomicBoolean forecastBusy = new AtomicBoolean(false);
+    private volatile ScheduledExecutorService predTimer = Executors.newSingleThreadScheduledExecutor();
     private volatile Listener listener;
     private volatile boolean started = false;
 
@@ -73,8 +79,9 @@ public class Engine {
         lastTick = store.lastTickTs("AL");
         lastKline = store.lastKlineTs("AL", "1m");
         schedule();
-        // 首次启动只拉 1 分钟线与日线；长周期（5/15/30/60 分钟）靠预置库，
-        // 过期时由 refreshLongPeriodsIfStale() 增量补齐，避免每次启动都跑一遍大请求
+        scheduleForecast();
+        // 首屏先出结论（用库里已有数据），随后采集线程再增量补
+        computeForecast(false);
         refresh(false);
         autoSyncIfEmpty();
     }
@@ -104,6 +111,7 @@ public class Engine {
 
     public void stop() {
         timer.shutdownNow();
+        predTimer.shutdownNow();
         worker.shutdownNow();
         started = false;
     }
@@ -119,6 +127,44 @@ public class Engine {
     private void schedule() {
         int sec = cfg.refreshSec();
         timer.scheduleWithFixedDelay(() -> refresh(false), sec, sec, TimeUnit.SECONDS);
+    }
+
+    /**
+     * 预测调度：对齐到每个整分钟（:00 秒）跑一次。
+     * 整分只重算 ≤30 分钟的四档；整点额外增量补 1m/日线并跑全七档。
+     */
+    private void scheduleForecast() {
+        long now = System.currentTimeMillis();
+        long delay = 60_000 - (now % 60_000) + 300;  // 留 300ms 容错，避免落在 :59.99
+        nextForecastAt = now + delay;
+        try {
+            predTimer.scheduleAtFixedRate(this::tickForecast, delay, 60_000, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void tickForecast() {
+        if (!forecastBusy.compareAndSet(false, true)) return;
+        long now = System.currentTimeMillis();
+        boolean wholeHour = (now / 60_000) % 60 == 0;
+        nextForecastAt = now + 60_000;
+        try {
+            if (wholeHour) {
+                // 整点加强：先把数据补到最新，再跑全七档
+                incrementalMinute(true);
+                incrementalDaily(true);
+                refreshLongPeriodsIfStale();
+                computeForecast(true);
+            } else {
+                computeForecast(false);
+            }
+            verifyDue();
+        } catch (Exception e) {
+            lastError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        } finally {
+            forecastBusy.set(false);
+            if (listener != null) main.post(listener::onUpdate);
+        }
     }
 
     public Map<String, SinaClient.Quote> quotes() {
@@ -174,68 +220,199 @@ public class Engine {
         }
         if (!q.isEmpty()) lastTick = System.currentTimeMillis();
 
-        // 2) K 线：首次/手动/超过 5 分钟才拉，节省流量
-        boolean needKline = full || lastKline == 0
-                || System.currentTimeMillis() - lastKline > 300_000L;
-        if (needKline) {
-            for (String code : Products.CODES) {
-                try {
-                    List<Bar> m = sina.minute(code);
-                    if (!m.isEmpty()) {
-                        store.upsertKlines(code, "1m", m);
-                        klineCache.put(code + "|1m", store.klines(code, "1m", 1600));
-                    }
-                } catch (Exception ignored) {
-                }
-                try {
-                    List<Bar> d = sina.daily(code);
-                    if (!d.isEmpty()) {
-                        store.upsertKlines(code, "1d", d);
-                        klineCache.put(code + "|1d", store.klines(code, "1d", 4000));
-                    }
-                } catch (Exception ignored) {
-                }
-            }
-            // 手动刷新时顺带更新 60 分钟线（约 180 天历史），自动刷新不拉，省流量
-            if (full) refreshLongPeriods();
-            lastKline = System.currentTimeMillis();
-        }
-
-        // 预置/上次同步的 60 分钟线过期时补一次（3 小时），保证长周期曲线不断
+        // 2) 分钟线增量：每 60 秒一次，只补「本地最后一根及之后」
+        incrementalMinute(full);
+        // 3) 日线增量：每 30 分钟一次
+        incrementalDaily(full);
+        // 4) 60 分钟线过期时兜底（预置库很旧 / 长时间没开应用）
         refreshLongPeriodsIfStale();
 
-        // 3) 重算预测
+        // 5) 回填到期预测（用当前价验证方向）
+        verifyDue();
+
+        // 6) 清理 30 天前的秒级数据，避免无限膨胀
+        store.prune(30);
+
+        // 7) 预测不在这里重算：整分钟对齐由 scheduleForecast() 负责；
+        //    只有还没有任何结论时（首启 / 换品种）补一次，避免首屏空白
+        if (forecasts.isEmpty()) computeForecast(false);
+    }
+
+    /**
+     * 1 分钟线增量：只把「本地最后一根及之后」的 bar 写库，
+     * 并用本次拿到的 1m 序列按时间桶聚合，增量补 5/15/30/60 分钟。
+     *
+     * @param force true 时忽略 60 秒节流（整点加强 / 手动刷新）
+     * @return 实际写入的根数（含本地聚合产物）
+     */
+    public synchronized int incrementalMinute(boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && now - lastMinuteSync < 60_000L) return 0;
+        lastMinuteSync = now;
+        int added = 0;
         for (String code : Products.CODES) {
-            JSONObject f = Forecaster.forecast(code,
-                    bars(code, "1m"), bars(code, "60m"), bars(code, "1d"));
+            List<Bar> m;
+            try {
+                m = sina.minute(code, 1);
+            } catch (Exception e) {
+                continue;
+            }
+            if (m.isEmpty()) continue;
+            long localMax = store.lastKlineTs(code, "1m");
+            List<Bar> fresh = tail(m, localMax);
+            if (!fresh.isEmpty()) {
+                store.upsertKlines(code, "1m", fresh);
+                mergeCache(code, "1m", fresh);
+                added += fresh.size();
+            }
+            // 伦铝源站只给当日分时，聚合长周期没有意义，保持「1m + 日线」
+            if ("AHD".equals(code)) continue;
+            for (String period : new String[]{"5m", "15m", "30m", "60m"}) {
+                List<Bar> agg = Forecaster.aggregateByTime(m, stepMinutes(period));
+                if (agg.isEmpty()) continue;
+                List<Bar> add = tail(agg, store.lastKlineTs(code, period));
+                if (add.isEmpty()) continue;
+                store.upsertKlines(code, period, add);
+                mergeCache(code, period, add);
+                added += add.size();
+            }
+            try {
+                Thread.sleep(120);
+            } catch (InterruptedException ignored) {
+            }
+        }
+        if (added > 0) lastKline = now;
+        return added;
+    }
+
+    /** 日线增量：每 30 分钟一次，只写本地最后一根及之后。 */
+    public synchronized int incrementalDaily(boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && now - lastDailySync < 30 * 60_000L) return 0;
+        lastDailySync = now;
+        int added = 0;
+        for (String code : Products.CODES) {
+            try {
+                List<Bar> d = sina.daily(code);
+                if (d.isEmpty()) continue;
+                List<Bar> add = tail(d, store.lastKlineTs(code, "1d"));
+                if (!add.isEmpty()) {
+                    store.upsertKlines(code, "1d", add);
+                    mergeCache(code, "1d", add);
+                    added += add.size();
+                }
+                Thread.sleep(160);
+            } catch (Exception ignored) {
+            }
+        }
+        return added;
+    }
+
+    /** 只保留 ts >= localMax 的部分（localMax<=0 表示本地为空，全要）。 */
+    private static List<Bar> tail(List<Bar> bars, long localMax) {
+        List<Bar> out = new ArrayList<>();
+        for (Bar b : bars) if (localMax <= 0 || b.ts >= localMax) out.add(b);
+        return out;
+    }
+
+    /** 把增量 bar 并入内存缓存（同 ts 覆盖、尾部追加），不整表重读。 */
+    private void mergeCache(String code, String period, List<Bar> fresh) {
+        String key = code + "|" + period;
+        List<Bar> cur = klineCache.get(key);
+        if (cur == null || cur.isEmpty()) return;   // 未缓存：下次读库自然带上
+        int limit = "1d".equals(period) ? 4000 : 1600;
+        List<Bar> merged = new ArrayList<>(cur);
+        for (Bar b : fresh) {
+            Bar last = merged.isEmpty() ? null : merged.get(merged.size() - 1);
+            if (last == null || b.ts > last.ts) merged.add(b);
+            else if (b.ts == last.ts) merged.set(merged.size() - 1, b);
+        }
+        while (merged.size() > limit) merged.remove(0);
+        klineCache.put(key, merged);
+    }
+
+    private static int stepMinutes(String period) {
+        switch (period) {
+            case "60m":
+                return 60;
+            case "30m":
+                return 30;
+            case "15m":
+                return 15;
+            case "5m":
+                return 5;
+            default:
+                return 1;
+        }
+    }
+
+    /**
+     * 重算预测。full=true 跑全部七档；false 只重算 ≤30 分钟的四档
+     * （4h/8h/1d 沿用上一次结果，整点加强时才全部重算）。
+     */
+    public synchronized JSONObject computeForecast(boolean full) {
+        for (String code : Products.CODES) {
+            JSONObject prev = forecasts.get(code);
+            JSONObject f = Forecaster.forecast(code, bars(code, "1m"),
+                    bars(code, "60m"), bars(code, "1d"), prev, !full);
             forecasts.put(code, f);
             saveForecasts(f);
         }
-
-        // 4) 回填到期预测（用当前价验证方向）
-        verifyDue();
-
-        // 5) 清理 30 天前的秒级数据，避免无限膨胀
-        store.prune(30);
+        lastForecastAt = System.currentTimeMillis();
+        return forecasts.get(Products.CODES[0]);
     }
 
-    /** 手动刷新时顺带更新 5/15/30/60 分钟线（伦铝源站只给当日分时，跳过）。 */
-    private void refreshLongPeriods() {
-        for (String code : Products.CODES) {
-            if ("AHD".equals(code)) continue;
-            for (String period : new String[]{"5m", "15m", "30m", "60m"}) {
-                try {
-                    List<Bar> bars = sina.minute(code, SinaClient.typeOf(period));
-                    if (!bars.isEmpty()) {
-                        store.upsertKlines(code, period, bars);
-                        klineCache.put(code + "|" + period,
-                                store.klines(code, period, 1600));
-                    }
-                    Thread.sleep(220);
-                } catch (Exception ignored) {
-                }
+    /** 手动刷新预测：先把数据增量补到最新，再跑全七档。后台线程调用。 */
+    public JSONObject forceForecast(SyncListener cb) {
+        JSONObject res = new JSONObject();
+        if (!forecastBusy.compareAndSet(false, true)) {
+            try {
+                res.put("ok", false);
+                res.put("message", "预测正在刷新中，请稍候");
+            } catch (Exception ignored) {
             }
+            return res;
         }
+        try {
+            if (cb != null) cb.onStep("补齐最近行情（1 分钟线 + 日线）…", 0, 3);
+            int addMin = incrementalMinute(true);
+            int addDay = incrementalDaily(true);
+            refreshLongPeriodsIfStale();
+            if (cb != null) cb.onStep("重算三品种七档方向…", 1, 3);
+            computeForecast(true);
+            if (cb != null) cb.onStep("回填到期预测…", 2, 3);
+            verifyDue();
+            int total = addMin + addDay;
+            res.put("ok", true);
+            res.put("added_minute", addMin);
+            res.put("added_daily", addDay);
+            res.put("forecast_at", lastForecastAt);
+            res.put("message", "已更新：" + (total > 0 ? "新增 " + total + " 根数据 · " : "")
+                    + "七档方向已重算");
+            nextForecastAt = (System.currentTimeMillis() / 60_000 + 1) * 60_000 + 300;
+        } catch (Exception e) {
+            try {
+                res.put("ok", false);
+                res.put("message", "刷新失败：" + brief(e));
+            } catch (Exception ignored) {
+            }
+        } finally {
+            forecastBusy.set(false);
+            if (listener != null) main.post(listener::onUpdate);
+        }
+        return res;
+    }
+
+    public long lastForecastAt() {
+        return lastForecastAt;
+    }
+
+    public long nextForecastAt() {
+        return nextForecastAt;
+    }
+
+    public boolean isForecastBusy() {
+        return forecastBusy.get();
     }
 
     /** 60 分钟线超过 3 小时未更新时补拉一次（只拉 60m，流量可控）。 */
@@ -257,7 +434,12 @@ public class Engine {
     }
 
     public interface SyncListener {
-        void onStep(String message);
+        /**
+         * @param message 当前步骤文案
+         * @param done    已完成的「品种 × 周期」步数（从 0 开始）
+         * @param total   总步数
+         */
+        void onStep(String message, int done, int total);
     }
 
     private final AtomicBoolean syncing = new AtomicBoolean(false);
@@ -285,17 +467,20 @@ public class Engine {
         long now = System.currentTimeMillis();
         long cut = now - 180L * 86400_000L;
         int added = 0;
+        int step = 0;
+        int totalSteps = 0;
+        for (String code : Products.CODES) totalSteps += periodsOf(code).length;
         StringBuilder fail = new StringBuilder();
         JSONObject detail = new JSONObject();
         try {
             for (String code : Products.CODES) {
                 String name = Products.nameOf(code);
                 JSONObject one = new JSONObject();
-                String[] periods = "AHD".equals(code)
-                        ? new String[]{"1d", "1m"}
-                        : new String[]{"1d", "1m", "5m", "15m", "30m", "60m"};
+                String[] periods = periodsOf(code);
                 for (String period : periods) {
-                    if (cb != null) cb.onStep("同步 " + name + " " + labelOf(period) + "…");
+                    if (cb != null) {
+                        cb.onStep("同步 " + name + " " + labelOf(period) + "…", step, totalSteps);
+                    }
                     JSONObject r = syncOne(code, period, cut);
                     one.put(period, r);
                     added += r.optInt("added", 0);
@@ -303,10 +488,12 @@ public class Engine {
                         fail.append(name).append(labelOf(period))
                                 .append("[").append(r.optString("error")).append("] ");
                     }
+                    step++;
                     Thread.sleep("1d".equals(period) ? 220 : 260);
                 }
                 detail.put(code, one);
             }
+            if (cb != null) cb.onStep("写入本地库并刷新…", totalSteps, totalSteps);
             reloadCaches();
             cfg.setLastSync(now);
             JSONObject periods = store.periodStats();
@@ -371,6 +558,13 @@ public class Engine {
             }
         }
         return r;
+    }
+
+    /** 各品种要同步的周期；伦铝（外盘）只有日线与 1 分钟分时。 */
+    private static String[] periodsOf(String code) {
+        return "AHD".equals(code)
+                ? new String[]{"1d", "1m"}
+                : new String[]{"1d", "1m", "5m", "15m", "30m", "60m"};
     }
 
     private static String labelOf(String period) {
@@ -502,6 +696,9 @@ public class Engine {
             o.put("last_error", lastError);
             o.put("busy", busy.get());
             o.put("refresh_sec", cfg.refreshSec());
+            o.put("last_forecast", lastForecastAt);
+            o.put("next_forecast", nextForecastAt);
+            o.put("forecast_busy", forecastBusy.get());
             o.put("last_sync", cfg.lastSync());
             o.put("last_sync_msg", cfg.lastSyncMsg());
             o.put("seed_version", cfg.seedVersion());

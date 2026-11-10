@@ -175,13 +175,46 @@ public class Bridge {
         }
         emit("onToast", q("开始同步最近 180 天数据…"));
         pool.execute(() -> {
-            JSONObject res = engine.syncHistory(msg -> emit("onSyncStep", q(msg)));
+            JSONObject res = engine.syncHistory((msg, done, total) -> {
+                JSONObject o = new JSONObject();
+                try {
+                    o.put("msg", msg);
+                    o.put("done", done);
+                    o.put("total", total);
+                    o.put("pct", total > 0 ? Math.round(done * 100f / total) : 0);
+                } catch (Exception ignored) {
+                }
+                emit("onSyncStep", o.toString());
+            });
             emit("onSync", res.toString());
         });
     }
 
     private static double round(double v) {
         return Math.round(v * 10000.0) / 10000.0;
+    }
+
+    /** 手动刷新预测：先增量补数据，再重算七档并回填到期记录。 */
+    @JavascriptInterface
+    public void predict() {
+        if (engine.isForecastBusy()) {
+            emit("onToast", q("预测正在刷新中，请稍候"));
+            return;
+        }
+        pool.execute(() -> {
+            JSONObject res = engine.forceForecast((msg, done, total) -> {
+                JSONObject o = new JSONObject();
+                try {
+                    o.put("msg", msg);
+                    o.put("done", done);
+                    o.put("total", total);
+                    o.put("pct", total > 0 ? Math.round(done * 100f / total) : 0);
+                } catch (Exception ignored) {
+                }
+                emit("onPredictStep", o.toString());
+            });
+            emit("onPredict", res.toString());
+        });
     }
 
     // ---------------- 设置 ----------------
@@ -374,15 +407,36 @@ public class Bridge {
     }
 
     @JavascriptInterface
-    public void installUpdate(String apkUrl, String version) {
+    public void installUpdate(String apkUrl, String version, long size) {
         pool.execute(() -> {
             Updater u = new Updater(ctx, cfg);
             Updater.Info info = new Updater.Info();
             info.apkUrl = apkUrl;
             info.version = version;
-            String err = u.downloadAndInstall(info);
-            if (!err.isEmpty()) emit("onToast", q(err));
+            info.size = size;
+            emitUpdateProgress("start", 0, size);
+            String err = u.downloadAndInstall(info,
+                    (done, total) -> emitUpdateProgress("downloading", done, total));
+            if (!err.isEmpty()) {
+                emitUpdateProgress("error", 0, 0);
+                emit("onToast", q(err));
+            } else {
+                emitUpdateProgress("done", size, size);
+            }
         });
+    }
+
+    /** 下载进度：phase = start / downloading / done / error。 */
+    private void emitUpdateProgress(String phase, long done, long total) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("phase", phase);
+            o.put("done", done);
+            o.put("total", total);
+            o.put("pct", total > 0 ? Math.min(100, Math.round(done * 100f / total)) : 0);
+        } catch (Exception ignored) {
+        }
+        emit("onUpdateProgress", o.toString());
     }
 
     @JavascriptInterface

@@ -34,9 +34,18 @@ public class Forecaster {
 
     public static JSONObject forecast(String code, List<Bar> minute, List<Bar> hour60,
                                       List<Bar> daily) {
+        return forecast(code, minute, hour60, daily, null, false);
+    }
+
+    /**
+     * @param prev      上一次的完整结果；{@code shortOnly} 时用它复用 4h / 8h / 1d 三档
+     * @param shortOnly true 只重算 ≤30 分钟的四档（整分钟调度用），长周期档沿用 prev
+     */
+    public static JSONObject forecast(String code, List<Bar> minute, List<Bar> hour60,
+                                      List<Bar> daily, JSONObject prev, boolean shortOnly) {
         JSONObject out = new JSONObject();
-        double price = !minute.isEmpty() ? minute.get(minute.size() - 1).c
-                : (!daily.isEmpty() ? daily.get(daily.size() - 1).c : 0);
+        double price = minute != null && !minute.isEmpty() ? minute.get(minute.size() - 1).c
+                : (daily != null && !daily.isEmpty() ? daily.get(daily.size() - 1).c : 0);
         JSONArray horizons = new JSONArray();
         double acc = 0, wsumTotal = 0;
 
@@ -52,7 +61,7 @@ public class Forecaster {
                 horizonBars = 1;
                 lookback = 20;
             } else if (minutes >= 240) {
-                src = aggregate(hour60, minutes / 60);
+                src = aggregateByTime(hour60, minutes);
                 horizonBars = 1;
                 lookback = 6;
             } else {
@@ -60,7 +69,8 @@ public class Forecaster {
                 horizonBars = minutes;
                 lookback = minutes;
             }
-            JSONObject r = one(key, h[1], minutes, src, horizonBars, lookback, price);
+            JSONObject r = shortOnly && minutes >= 240 ? reuse(prev, key) : null;
+            if (r == null) r = one(key, h[1], minutes, src, horizonBars, lookback, price);
             horizons.put(r);
             double conf = r.optDouble("confidence", 0);
             double dir = "上涨".equals(r.optString("direction")) ? 1
@@ -72,7 +82,8 @@ public class Forecaster {
 
         double score = wsumTotal > 0 ? acc / wsumTotal : 0;
         String overall = score >= 0.3 ? "看涨" : score <= -0.3 ? "看跌" : "中性";
-        JSONObject ind = Indicators.summary(minute.size() >= 30 ? minute : daily);
+        JSONObject ind = Indicators.summary(minute != null && minute.size() >= 30
+                ? minute : (daily == null ? new ArrayList<>() : daily));
 
         try {
             out.put("code", code);
@@ -83,29 +94,54 @@ public class Forecaster {
             out.put("overall", overall);
             out.put("recommendation", recommend(overall, ind, horizons));
             out.put("source", "quant");
+            out.put("mode", shortOnly ? "short" : "full");
             out.put("ts", System.currentTimeMillis());
         } catch (Exception ignored) {
         }
         return out;
     }
 
-    /** 把 group 根合成一根（OHLCV），用于 60m → 4h/8h。 */
-    static List<Bar> aggregate(List<Bar> src, int group) {
+    /** 从上次结果里取某一档（深拷贝），没有则返回 null。 */
+    private static JSONObject reuse(JSONObject prev, String key) {
+        if (prev == null) return null;
+        JSONArray hs = prev.optJSONArray("horizons");
+        if (hs == null) return null;
+        for (int i = 0; i < hs.length(); i++) {
+            JSONObject h = hs.optJSONObject(i);
+            if (h != null && key.equals(h.optString("key"))) {
+                try {
+                    return new JSONObject(h.toString());
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 按时间桶聚合成 OHLCV：桶起点 = ⌊ts / 周期⌋ × 周期。
+     * 用时间对齐而不是「每 N 根一组」，否则序列首根错位会让 4h/8h 落在奇怪的时刻。
+     */
+    public static List<Bar> aggregateByTime(List<Bar> src, int minutes) {
         List<Bar> out = new ArrayList<>();
-        if (src == null || src.isEmpty() || group <= 1) return src == null ? out : src;
-        int n = 0;
+        if (src == null || src.isEmpty()) return out;
+        if (minutes <= 1) {
+            out.addAll(src);
+            return out;
+        }
+        long bucket = minutes * 60_000L;
+        long curTs = Long.MIN_VALUE;
         Bar cur = null;
         for (Bar b : src) {
-            if (cur == null) {
-                cur = new Bar(b.ts, b.o, b.h, b.l, b.c, b.v);
+            long t = b.ts - Math.floorMod(b.ts, bucket);
+            if (cur == null || t != curTs) {
+                if (cur != null) out.add(cur);
+                curTs = t;
+                cur = new Bar(t, b.o, b.h, b.l, b.c, b.v);
             } else {
-                cur = new Bar(b.ts, cur.o, Math.max(cur.h, b.h),
+                cur = new Bar(curTs, cur.o, Math.max(cur.h, b.h),
                         Math.min(cur.l, b.l), b.c, cur.v + b.v);
-            }
-            if (++n >= group) {
-                out.add(cur);
-                cur = null;
-                n = 0;
             }
         }
         if (cur != null) out.add(cur);

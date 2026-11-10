@@ -314,7 +314,10 @@ html.light .chip.on {
   margin-top: 5px; line-height: 1.4;
   display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
 }
-.chart-foot .muted { font-size: 10.5px; text-align: right; }
+.chart-foot .muted { font-size: 10.5px; text-align: right; line-height: 1.5; }
+.chart-foot .cm-ok { color: var(--muted); }
+.chart-foot .cm-warn { color: #f0a63c; font-weight: 600; }
+html.light .chart-foot .cm-warn { color: #b96b00; }
 .chart-tip { flex: 0 0 auto; font-size: 9.5px; color: var(--muted); opacity: .72; }
 
 /* ---------- 图例 ---------- */
@@ -522,6 +525,48 @@ html.light .btn.danger { background: #ffffff; color: var(--up); border-color: rg
 .btn:disabled { opacity: .42; }
 
 .upd-info { margin-top: 10px; font-size: 12px; color: var(--muted); line-height: 1.65; white-space: pre-wrap; }
+
+/* ---------- 进度条（应用更新下载 / 历史同步） ---------- */
+.prog-wrap { margin-top: 10px; }
+.prog-wrap[hidden] { display: none; }
+.prog {
+  position: relative;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--bar-track);
+  overflow: hidden;
+}
+.prog > i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--cyan), var(--violet));
+  box-shadow: 0 0 10px -2px var(--cyan);
+  transition: width .18s linear;
+}
+/* 总长度未知（服务端没给 Content-Length）时的滑动占位 */
+.prog.indet > i {
+  width: 38% !important;
+  animation: progSlide 1.1s ease-in-out infinite;
+}
+.prog.done > i { background: linear-gradient(90deg, var(--down), var(--cyan)); }
+.prog.fail > i { background: var(--up); box-shadow: none; }
+@keyframes progSlide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(280%); }
+}
+.prog-meta {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 8px; margin-top: 5px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+}
+.prog-meta #updProgPct, .prog-meta #syncProgPct,
+.prog-meta #predProgPct { flex: 0 0 auto; color: var(--text); }
+@media (prefers-reduced-motion: reduce) {
+  .prog > i { transition: none; }
+  .prog.indet > i { animation: none; width: 100% !important; opacity: .45; }
+}
 
 .about-row {
   display: flex; justify-content: space-between;

@@ -179,8 +179,17 @@ public class Updater {
 
     // ---------------- 下载安装 ----------------
 
+    /** 下载进度回调；total<=0 表示服务端没给长度（只能按已下载字节显示）。 */
+    public interface Progress {
+        void onProgress(long done, long total);
+    }
+
     /** 下载并触发安装。必须在后台线程调用；返回空串表示已发起安装。 */
     public String downloadAndInstall(Info info) {
+        return downloadAndInstall(info, null);
+    }
+
+    public String downloadAndInstall(Info info, Progress cb) {
         if (info.apkUrl == null || info.apkUrl.isEmpty()) return "没有可下载的安装包";
         File dir = new File(ctx.getCacheDir(), "update");
         if (!dir.exists() && !dir.mkdirs()) return "无法创建缓存目录";
@@ -198,6 +207,10 @@ public class Updater {
                 return "下载失败：HTTP " + code + hint(code) + (body.isEmpty() ? "" : "｜" + body);
             }
             long total = 0;
+            long declared = c.getContentLengthLong();
+            if (declared <= 0) declared = info.size;
+            if (cb != null) cb.onProgress(0, declared);
+            long lastAt = 0, lastBytes = 0;
             try (InputStream in = c.getInputStream();
                  FileOutputStream out = new FileOutputStream(part)) {
                 byte[] buf = new byte[16384];
@@ -205,9 +218,17 @@ public class Updater {
                 while ((n = in.read(buf)) > 0) {
                     out.write(buf, 0, n);
                     total += n;
+                    // 节流：最多 5 次/秒，避免频繁跨线程回调拖慢下载
+                    long nowMs = System.currentTimeMillis();
+                    if (cb != null && (nowMs - lastAt >= 200 || total - lastBytes >= 512 * 1024)) {
+                        lastAt = nowMs;
+                        lastBytes = total;
+                        cb.onProgress(total, declared);
+                    }
                 }
                 out.flush();
             }
+            if (cb != null) cb.onProgress(total, declared > 0 ? declared : total);
             c.disconnect();
             c = null;
 

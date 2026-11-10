@@ -21,7 +21,9 @@
     compare: false,   // 三品种叠加（涨跌幅归一化）
     hidden: {},       // 对比模式下被隐藏的序列
     chart: null,      // 当前图表几何，供十字星重绘
-    crossTimer: 0
+    crossTimer: 0,
+    crossActive: false, // 按住十字星期间冻结曲线跟随
+    predBusy: false
   };
 
   var PERIODS = [
@@ -145,7 +147,7 @@
     var codes = (S.state.products || []).map(function (p) { return p.code; });
     if (codes.length && codes.indexOf(S.code) < 0) S.code = codes[0];
     renderQuotes();
-    renderChart();
+    if (!S.crossActive) renderChart();   // 按住十字星时先冻结，松手后再跟最新
     renderIndicators();
     renderForecast();
     renderStats();
@@ -256,7 +258,22 @@
         out = aggregate((one && one.bars || []), period.step);
       }
     } catch (e) { out = []; }
+    // 把最新报价接到尾部：K 线只到上一根收盘，不接的话曲线总比现价慢一拍
+    var q = quoteOf(code);
+    if (q && q.last > 0 && out.length) {
+      var lastTs = out[out.length - 1][0];
+      var qTs = q.ts && q.ts > 0 ? q.ts : Date.now();
+      if (qTs > lastTs) out.push([qTs, q.last, q.last, q.last, q.last, 0]);
+    }
     return out;
+  }
+
+  function quoteOf(code) {
+    var ps = (S.state && S.state.products) || [];
+    for (var i = 0; i < ps.length; i++) {
+      if (ps[i].code === code) return ps[i].quote || null;
+    }
+    return null;
   }
 
   function renderChart() {
@@ -312,12 +329,21 @@
         return s.bars[s.bars.length - 1][0];
       }));
       var days = Math.round((t1 - t0) / 86400000);
-      meta.textContent = (period.label || period.k) + ' · ' + total + ' 点'
+      var head = esc((period.label || period.k) + ' · ' + total + ' 点'
         + (compare ? ' · 涨跌幅对比' : '') + ' · ' + dateStr(t0)
-        + (days > 0 ? '（' + days + ' 天）' : '');
-      if (isTick(period)) {
-        meta.textContent += ' · 采集点';
-      }
+        + (days > 0 ? '（' + days + ' 天）' : '')
+        + (isTick(period) ? ' · 采集点' : ''));
+      // 最新一根的时间与滞后情况：超过 2 个采集周期没新数据就标黄
+      var lastBar = visible[0].bars[visible[0].bars.length - 1];
+      var lagMs = Date.now() - t1;
+      var limitMs = Math.max(((S.settings && S.settings.refresh_sec) || 30) * 2000, 120000);
+      var stale = period.k !== '1d' && lagMs > limitMs;
+      var lagTxt = Math.round(lagMs / 1000);
+      var tail = '最新 ' + (compare ? '' : num(lastBar[4], 2) + ' · ')
+        + timeTick(t1, period.k, true)
+        + (stale ? ' · 滞后 ' + (lagTxt >= 120 ? Math.round(lagTxt / 60) + ' 分' : lagTxt + ' 秒') : '');
+      meta.innerHTML = head + '<br><span class="' + (stale ? 'cm-warn' : 'cm-ok') + '">'
+        + esc(tail) + '</span>';
     }
 
     var geo = buildGeo(canvas, series, compare, period);
@@ -721,6 +747,7 @@
         + '</div>';
     });
     $('#hzGrid').innerHTML = html || '<div class="empty">数据不足，先让应用运行一段时间</div>';
+    renderForecastMeta();
   }
 
   // ---------------- 历史 ----------------
@@ -819,7 +846,7 @@
     var s = {};
     try {
       s = JSON.parse(DEMO
-        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.2.0"}'
+        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.3.0"}'
         : N.settings());
     } catch (e) { s = {}; }
     S.settings = s;
@@ -967,9 +994,41 @@
 
   // ---------------- 更新 ----------------
 
+  /** 通用进度条：wrap 里 .prog > i 是填充，.prog-meta 是两个文字位。 */
+  function progSet(sel, pct, text, state) {
+    var wrap = $(sel);
+    if (!wrap) return;
+    wrap.hidden = false;
+    var bar = wrap.querySelector('.prog');
+    var fill = wrap.querySelector('.prog > i');
+    var label = wrap.querySelector('.prog-meta span:first-child');
+    var num = wrap.querySelector('.prog-meta span:last-child');
+    if (bar) bar.className = 'prog' + (state ? ' ' + state : '');
+    var v = Math.max(0, Math.min(100, pct || 0));
+    if (fill) fill.style.width = v + '%';
+    if (num) num.textContent = state === 'indet' ? '—' : Math.round(v) + '%';
+    if (text != null && label) label.textContent = text;
+  }
+
+  function progHide(sel) {
+    var wrap = $(sel);
+    if (wrap) wrap.hidden = true;
+  }
+
+  function mb(b) { return ((b || 0) / 1048576).toFixed(1); }
+
   function onSyncStep(msg) {
-    var info = $('#syncInfo');
-    if (info) info.textContent = msg;
+    var text, pct = 0, hasTotal = false;
+    if (msg && typeof msg === 'object') {
+      text = msg.msg || '';
+      hasTotal = msg.total > 0;
+      pct = msg.pct || 0;
+      if (hasTotal) text += '（' + Math.min((msg.done || 0) + 1, msg.total) + '/' + msg.total + ' 步）';
+    } else {
+      text = String(msg == null ? '' : msg);
+    }
+    // 步骤文案只放进度条里，下面的 hint 在同步过程中保持固定说明，避免重复两行同样的字
+    progSet('#syncProgWrap', pct, text, hasTotal ? '' : 'indet');
   }
 
   function onSync(res) {
@@ -983,9 +1042,11 @@
     if (!res || !res.ok) {
       var m = (res && res.message) || '同步失败';
       if (info) info.textContent = m;
+      progSet('#syncProgWrap', 0, m, 'fail');
       toast(m);
       return;
     }
+    progSet('#syncProgWrap', 100, '同步完成 · 新增 ' + (res.fetched || 0) + ' 根', 'done');
     if (info) {
       info.textContent = '同步完成：' + res.message
         + (res.warn ? '\n' + res.warn : '');
@@ -994,15 +1055,83 @@
     pull();
   }
 
+  function onPredictStep(step) {
+    if (!step) return;
+    var txt = step.msg || '';
+    if (step.total > 0) txt += '（' + Math.min((step.done || 0) + 1, step.total) + '/' + step.total + ' 步）';
+    progSet('#predProgWrap', step.pct || 0, txt, step.total > 0 ? '' : 'indet');
+  }
+
+  function onPredict(res) {
+    S.predBusy = false;
+    var b = $('#btnPredict');
+    if (b) {
+      b.disabled = false;
+      b.textContent = '更新预测';
+    }
+    if (!res || !res.ok) {
+      var m = (res && res.message) || '刷新失败';
+      progSet('#predProgWrap', 0, m, 'fail');
+      toast(m);
+      return;
+    }
+    progSet('#predProgWrap', 100,
+      (res.message || '已更新') + '（分钟线 ' + (res.added_minute || 0)
+      + ' / 日线 ' + (res.added_daily || 0) + ' 根）', 'done');
+    // 立刻回填时间戳，避免下面的 pull → renderForecastMeta 又显示「尚未更新」
+    S.state = S.state || {};
+    S.state.last_forecast = res.forecast_at || Date.now();
+    if (res.next_forecast) S.state.next_forecast = res.next_forecast;
+    toast(res.message || '预测已更新');
+    pull();
+  }
+
+  /** 预测时间提示：上次/下次自动刷新。 */
+  function renderForecastMeta() {
+    var info = $('#predInfo');
+    if (!info || !S.state) return;
+    if (info.getAttribute('data-busy') === '1') return;
+    var last = S.state.last_forecast, next = S.state.next_forecast;
+    var txt = last ? '上次更新 ' + timeStr(last) : '尚未更新';
+    if (next && next > Date.now()) txt += ' · 下次自动 ' + timeStr(next);
+    txt += ' · 整分钟更短线四档，整点全量七档';
+    info.textContent = txt;
+  }
+
   function checkUpdate() {
     var info = $('#updInfo');
     info.textContent = '正在检查…';
     $('#btnUpdateInstall').disabled = true;
+    progHide('#updProgWrap');
     if (DEMO) {
       onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.0.0（演示）' });
       return;
     }
     try { N.checkUpdate(); } catch (e) { info.textContent = '检查失败：' + e.message; }
+  }
+
+  function onUpdateProgress(o) {
+    if (!o) return;
+    var btn = $('#btnUpdateInstall');
+    if (o.phase === 'error') {
+      progSet('#updProgWrap', 0, '下载失败，可重新点「重试更新」', 'fail');
+      if (btn) { btn.disabled = false; btn.textContent = '重试更新'; }
+      return;
+    }
+    if (o.phase === 'done') {
+      progSet('#updProgWrap', 100, '下载完成，正在调起系统安装…', 'done');
+      if (btn) { btn.disabled = true; btn.textContent = '下载完成'; }
+      return;
+    }
+    var known = o.total > 0;
+    var txt = known
+      ? '下载中 ' + mb(o.done) + ' / ' + mb(o.total) + ' MB'
+      : '下载中 ' + mb(o.done) + ' MB';
+    progSet('#updProgWrap', o.pct || 0, txt, known ? '' : 'indet');
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = known ? '下载中 ' + (o.pct || 0) + '%' : '下载中…';
+    }
   }
 
   function onUpdate(o) {
@@ -1100,13 +1229,15 @@
     var showCross = function (cross) {
       if (S.crossTimer) { clearTimeout(S.crossTimer); S.crossTimer = 0; }
       if (!S.chart) return;
+      S.crossActive = true;
       paint(cross);
     };
     var hideCross = function (after) {
       if (S.crossTimer) clearTimeout(S.crossTimer);
       S.crossTimer = setTimeout(function () {
         S.crossTimer = 0;
-        paint(null);
+        S.crossActive = false;
+        renderChart();   // 补上冻结期间到达的新数据，并恢复跟随最新
       }, after || 0);
     };
     cv.addEventListener('pointerdown', function (e) {
@@ -1197,7 +1328,15 @@
       var o = S.update;
       if (!o || !o.has_update) return;
       if (DEMO) { toast('演示模式不支持安装'); return; }
-      try { N.installUpdate(o.apk_url, o.version); } catch (e) { toast('下载失败'); }
+      progSet('#updProgWrap', 0, o.size > 0 ? '正在连接，共 ' + mb(o.size) + ' MB…' : '正在连接…', 'indet');
+      this.disabled = true;
+      this.textContent = '下载中…';
+      try {
+        N.installUpdate(o.apk_url, o.version, o.size || 0);
+      } catch (e) {
+        onUpdateProgress({ phase: 'error' });
+        toast('下载失败：' + e.message);
+      }
     });
     // 同步历史数据（最近 180 天）
     $('#btnSyncHistory').addEventListener('click', function () {
@@ -1208,12 +1347,35 @@
       var info = $('#syncInfo');
       if (info) {
         info.setAttribute('data-busy', '1');
-        info.textContent = '正在同步最近 180 天数据…';
+        info.textContent = '正在与官方源做增量同步，进度见上方进度条；中途请勿退出应用。';
       }
+      progSet('#syncProgWrap', 0, '正在连接数据源…', 'indet');
       try { N.syncHistory(); } catch (e) {
         b.disabled = false;
         b.textContent = '同步历史数据';
         toast('同步失败：' + e.message);
+      }
+    });
+
+    // 手动刷新预测（先增量补数据，再重算七档）
+    $('#btnPredict').addEventListener('click', function () {
+      if (DEMO) {
+        S.state = S.state || {};
+        onPredict({ ok: true, message: '演示模式：已重算七档', added_minute: 0, added_daily: 0 });
+        return;
+      }
+      var b = this;
+      b.disabled = true;
+      b.textContent = '刷新中…';
+      S.predBusy = true;
+      var info = $('#predInfo');
+      if (info) info.setAttribute('data-busy', '1');
+      progSet('#predProgWrap', 0, '正在补齐最近行情…', 'indet');
+      try { N.predict(); } catch (e) {
+        b.disabled = false;
+        b.textContent = '更新预测';
+        S.predBusy = false;
+        onPredict({ ok: false, message: '刷新失败：' + e.message });
       }
     });
 
@@ -1247,8 +1409,11 @@
     onData: function () { pull(); },
     onLlm: function (res) { onLlm(res); },
     onUpdate: function (o) { onUpdate(o); },
+    onUpdateProgress: function (o) { onUpdateProgress(o); },
     onSync: function (res) { onSync(res); },
     onSyncStep: function (msg) { onSyncStep(msg); },
+    onPredictStep: function (o) { onPredictStep(o); },
+    onPredict: function (res) { onPredict(res); },
     onToast: function (msg) { toast(msg); }
   };
 
