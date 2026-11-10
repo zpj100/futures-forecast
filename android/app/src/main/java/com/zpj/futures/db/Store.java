@@ -5,13 +5,19 @@ import android.content.Context;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
+import android.database.sqlite.SQLiteStatement;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -24,6 +30,38 @@ public class Store extends SQLiteOpenHelper {
     private static final int VERSION = 1;
     private static Store inst;
 
+    /** 应用级 Context：迁移 / 诊断需要从 assets 复制 seed.db。 */
+    private final Context appCtx;
+
+    // ---------------- v2.6.0 旧口径迁移 / 本地库诊断 ----------------
+
+    /** 旧口径迁移只处理这四个周期；1m / 1d 不动（1m 本地可能有比 seed 更新的数据）。 */
+    private static final String LEGACY_IN = "'5m','15m','30m','60m'";
+
+    /**
+     * 旧口径残留判定：ts 落在 seed 该组合 [min,max] 区间内、且不在 seed ts 集合。
+     * seed_ts / seed_bounds 为临时表，用 NOT IN 子查询（不拼接超长 IN，
+     * 也不依赖 SQLite 3.15+ 才支持的 (a,b,c) NOT IN 行值写法）。
+     */
+    private static final String LEGACY_WHERE =
+            "period IN (" + LEGACY_IN + ")"
+                    + " AND EXISTS (SELECT 1 FROM seed_bounds b WHERE b.code=kline.code"
+                    + " AND b.period=kline.period AND kline.ts BETWEEN b.lo AND b.hi)"
+                    + " AND (code||'|'||period||'|'||ts) NOT IN"
+                    + " (SELECT k FROM seed_ts WHERE k IS NOT NULL)";
+
+    /** 串行化临时表的建/查/删，避免迁移与诊断并发踩同一连接上的临时表。 */
+    private final Object legacyLock = new Object();
+    /** 进程级缓存：从 assets/seed.db 解析出的 (code,period) -> ts 集合与 [min,max]。 */
+    private static volatile SeedIndex seedIndex = null;
+    /** countLegacyBars 结果缓存，避免每次全表扫；写库方法会清除。 */
+    private volatile JSONObject legacyCache = null;
+
+    private static final class SeedIndex {
+        final Map<String, long[]> bounds = new HashMap<>();   // "code|period" -> {min,max}
+        final Map<String, Set<Long>> ts = new HashMap<>();    // "code|period" -> ts 集合
+    }
+
     public static synchronized Store get(Context ctx) {
         if (inst == null) inst = new Store(ctx.getApplicationContext());
         return inst;
@@ -31,6 +69,7 @@ public class Store extends SQLiteOpenHelper {
 
     private Store(Context ctx) {
         super(ctx, NAME, null, VERSION);
+        this.appCtx = ctx.getApplicationContext();
     }
 
     @Override
@@ -178,6 +217,7 @@ public class Store extends SQLiteOpenHelper {
         } finally {
             db.endTransaction();
         }
+        invalidateLegacyCache();
     }
 
     public List<Bar> klines(String code, String period, int limit) {
@@ -435,8 +475,17 @@ public class Store extends SQLiteOpenHelper {
 
     /** 删除某个周期全部 K 线（预置库重建时用）。 */
     public int clearKline(String period) {
-        return getWritableDatabase().delete("kline", "period=?",
+        int n = getWritableDatabase().delete("kline", "period=?",
                 new String[]{period});
+        invalidateLegacyCache();
+        return n;
+    }
+
+    /** 清空全部 K 线（保留 ticks / forecasts），rebuildLocalDb 重建用。 */
+    public int clearKline() {
+        int n = getWritableDatabase().delete("kline", null, null);
+        invalidateLegacyCache();
+        return n;
     }
 
     private int scalar(String sql) {
@@ -457,5 +506,275 @@ public class Store extends SQLiteOpenHelper {
 
     public void clearForecasts() {
         getWritableDatabase().delete("forecasts", null, null);
+    }
+
+    // ---------------- 本地库诊断（localDbStatus / exportBars / importBars 用） ----------------
+
+    /**
+     * 一次查询返回每 (code,period) 的 count/min/max：
+     * {"AL|1m":{"n":1040,"min":<ms>,"max":<ms>}, ...}。
+     */
+    public JSONObject klineStats() {
+        JSONObject o = new JSONObject();
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT code,period,COUNT(*),MIN(ts),MAX(ts) FROM kline GROUP BY code,period",
+                null);
+        try {
+            while (c.moveToNext()) {
+                JSONObject it = new JSONObject();
+                it.put("n", c.getInt(2));
+                it.put("min", c.isNull(3) ? 0L : c.getLong(3));
+                it.put("max", c.isNull(4) ? 0L : c.getLong(4));
+                o.put(c.getString(0) + "|" + c.getString(1), it);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            c.close();
+        }
+        return o;
+    }
+
+    /** 秒级快照总体 n/min/max：{"n":..,"min":..,"max":..}。 */
+    public JSONObject tickStats() {
+        JSONObject o = new JSONObject();
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*),MIN(ts),MAX(ts) FROM ticks", null);
+        try {
+            if (c.moveToFirst()) {
+                o.put("n", c.getInt(0));
+                o.put("min", c.isNull(1) ? 0L : c.getLong(1));
+                o.put("max", c.isNull(2) ? 0L : c.getLong(2));
+            } else {
+                o.put("n", 0);
+                o.put("min", 0);
+                o.put("max", 0);
+            }
+        } catch (Exception e) {
+            try {
+                o.put("n", 0);
+                o.put("min", 0);
+                o.put("max", 0);
+            } catch (Exception ignored) {
+            }
+        } finally {
+            c.close();
+        }
+        return o;
+    }
+
+    /** ts 严格大于 since、升序、最多 limit 根（导出分页用；与后端 _paginate 口径一致）。 */
+    public List<Bar> klinesSince(String code, String period, long since, int limit) {
+        List<Bar> out = new ArrayList<>();
+        int lim = Math.max(1, Math.min(5000, limit));
+        long s = Math.max(0L, since);
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT ts,o,h,l,c,v FROM kline WHERE code=? AND period=? AND ts>?"
+                        + " ORDER BY ts ASC LIMIT ?",
+                new String[]{code, period, String.valueOf(s), String.valueOf(lim)});
+        try {
+            while (c.moveToNext()) {
+                out.add(new Bar(c.getLong(0), c.getDouble(1), c.getDouble(2),
+                        c.getDouble(3), c.getDouble(4), c.getDouble(5)));
+            }
+        } finally {
+            c.close();
+        }
+        return out;
+    }
+
+    /**
+     * 供 localDbStatus 的 legacy 字段：返回各 (code,period) 旧口径残留行数
+     * {"AL|5m":N, ...}，仅覆盖 5m/15m/30m/60m（1m/1d 不产生条目）。
+     * 结果缓存，避免每次全表扫；任何 K 线写库都会清缓存。
+     */
+    public JSONObject countLegacyBars() {
+        JSONObject cached = legacyCache;
+        if (cached != null) return cached;
+        synchronized (legacyLock) {
+            cached = legacyCache;
+            if (cached != null) return cached;
+            JSONObject out = new JSONObject();
+            SQLiteDatabase db = getWritableDatabase();
+            try {
+                SeedIndex idx = loadSeedIndex(appCtx);
+                if (idx != null) {
+                    buildSeedTempTables(db, idx);
+                    Cursor c = db.rawQuery(
+                            "SELECT code,period,COUNT(*) FROM kline WHERE " + LEGACY_WHERE
+                                    + " GROUP BY code,period", null);
+                    try {
+                        while (c.moveToNext()) {
+                            out.put(c.getString(0) + "|" + c.getString(1), c.getInt(2));
+                        }
+                    } finally {
+                        c.close();
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                dropSeedTempTables(db);
+            }
+            legacyCache = out;
+            return out;
+        }
+    }
+
+    /**
+     * 旧口径自动迁移：把 assets/seed.db 拷到 cacheDir 只读打开，读每个 (code,period)
+     * 的 ts 集合（只处理 5m/15m/30m/60m），删除本地 kline 中「ts 落在 seed 该组合
+     * [min,max] 区间内且不在 seed ts 集合」的行，返回删除总数；异常返回 -1 不崩。
+     * 1m/1d 不动（1m 本地可能有比 seed 更新的数据）。
+     */
+    public int migrateLegacyBars(Context ctx) {
+        synchronized (legacyLock) {
+            SQLiteDatabase db = getWritableDatabase();
+            try {
+                SeedIndex idx = loadSeedIndex(ctx);
+                if (idx == null) return -1;
+                buildSeedTempTables(db, idx);
+                int deleted;
+                Cursor c = db.rawQuery(
+                        "SELECT COUNT(*) FROM kline WHERE " + LEGACY_WHERE, null);
+                try {
+                    deleted = c.moveToFirst() ? c.getInt(0) : 0;
+                } finally {
+                    c.close();
+                }
+                if (deleted > 0) db.execSQL("DELETE FROM kline WHERE " + LEGACY_WHERE);
+                invalidateLegacyCache();
+                return deleted;
+            } catch (Exception e) {
+                return -1;
+            } finally {
+                dropSeedTempTables(db);
+            }
+        }
+    }
+
+    /** 解析 assets/seed.db 构建进程级 seed 索引；失败返回 null（调用方判失败，不崩）。 */
+    private SeedIndex loadSeedIndex(Context ctx) {
+        SeedIndex cached = seedIndex;
+        if (cached != null) return cached;
+        synchronized (Store.class) {
+            cached = seedIndex;
+            if (cached != null) return cached;
+            File tmp = new File(ctx.getCacheDir(), "seed_legacy.db");
+            SQLiteDatabase seed = null;
+            try {
+                if (tmp.exists() && !tmp.delete()) { /* 忽略旧副本删除失败 */ }
+                try (InputStream in = ctx.getAssets().open("seed.db");
+                     FileOutputStream out = new FileOutputStream(tmp)) {
+                    byte[] buf = new byte[32768];
+                    int n;
+                    while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+                }
+                seed = SQLiteDatabase.openDatabase(
+                        tmp.getPath(), null, SQLiteDatabase.OPEN_READONLY);
+                SeedIndex idx = new SeedIndex();
+                Cursor c = seed.rawQuery(
+                        "SELECT code,period,ts FROM kline WHERE period IN (" + LEGACY_IN + ")",
+                        null);
+                try {
+                    while (c.moveToNext()) {
+                        String key = c.getString(0) + "|" + c.getString(1);
+                        long ts = c.getLong(2);
+                        Set<Long> set = idx.ts.get(key);
+                        if (set == null) {
+                            set = new HashSet<>();
+                            idx.ts.put(key, set);
+                        }
+                        set.add(ts);
+                        long[] b = idx.bounds.get(key);
+                        if (b == null) {
+                            idx.bounds.put(key, new long[]{ts, ts});
+                        } else {
+                            if (ts < b[0]) b[0] = ts;
+                            if (ts > b[1]) b[1] = ts;
+                        }
+                    }
+                } finally {
+                    c.close();
+                }
+                seedIndex = idx;
+                return idx;
+            } catch (Exception e) {
+                return null;
+            } finally {
+                if (seed != null) {
+                    try {
+                        seed.close();
+                    } catch (Exception ignored) {
+                    }
+                }
+                if (tmp.exists()) tmp.delete();
+            }
+        }
+    }
+
+    /** 在当前连接重建 seed_ts / seed_bounds 两张临时表并灌入 seed 索引。 */
+    private void buildSeedTempTables(SQLiteDatabase db, SeedIndex idx) {
+        db.execSQL("DROP TABLE IF EXISTS seed_ts");
+        db.execSQL("DROP TABLE IF EXISTS seed_bounds");
+        db.execSQL("CREATE TEMP TABLE seed_ts(k TEXT PRIMARY KEY, code TEXT, period TEXT, ts INTEGER)");
+        db.execSQL("CREATE TEMP TABLE seed_bounds(code TEXT, period TEXT, lo INTEGER, hi INTEGER,"
+                + " PRIMARY KEY(code,period))");
+        SQLiteStatement ins = null, insB = null;
+        db.beginTransaction();
+        try {
+            ins = db.compileStatement(
+                    "INSERT OR IGNORE INTO seed_ts(k,code,period,ts) VALUES(?,?,?,?)");
+            for (Map.Entry<String, Set<Long>> e : idx.ts.entrySet()) {
+                String key = e.getKey();
+                int bar = key.indexOf('|');
+                String code = bar >= 0 ? key.substring(0, bar) : key;
+                String period = bar >= 0 ? key.substring(bar + 1) : "";
+                for (long t : e.getValue()) {
+                    ins.clearBindings();
+                    ins.bindString(1, key + "|" + t);
+                    ins.bindString(2, code);
+                    ins.bindString(3, period);
+                    ins.bindLong(4, t);
+                    ins.executeInsert();
+                }
+            }
+            insB = db.compileStatement(
+                    "INSERT OR REPLACE INTO seed_bounds(code,period,lo,hi) VALUES(?,?,?,?)");
+            for (Map.Entry<String, long[]> e : idx.bounds.entrySet()) {
+                int bar = e.getKey().indexOf('|');
+                insB.clearBindings();
+                insB.bindString(1, bar >= 0 ? e.getKey().substring(0, bar) : e.getKey());
+                insB.bindString(2, bar >= 0 ? e.getKey().substring(bar + 1) : "");
+                insB.bindLong(3, e.getValue()[0]);
+                insB.bindLong(4, e.getValue()[1]);
+                insB.executeInsert();
+            }
+            db.setTransactionSuccessful();
+        } finally {
+            try {
+                if (ins != null) ins.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                if (insB != null) insB.close();
+            } catch (Exception ignored) {
+            }
+            db.endTransaction();
+        }
+    }
+
+    private void dropSeedTempTables(SQLiteDatabase db) {
+        try {
+            db.execSQL("DROP TABLE IF EXISTS seed_ts");
+        } catch (Exception ignored) {
+        }
+        try {
+            db.execSQL("DROP TABLE IF EXISTS seed_bounds");
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 任何 K 线写库后清掉 legacy 结果缓存。 */
+    private void invalidateLegacyCache() {
+        legacyCache = null;
     }
 }

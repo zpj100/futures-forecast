@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false">
+    <!-- 仅允许应用层 setServer 白名单里的 loopback/私有网段 http，公网 http 由 Java 拒绝；对照开关默认关 -->
+    <!--
+        base-config 放开平台层明文；真正的地址白名单由 Bridge.isValidServerBase 在应用层强制：
+        http 仅 127.0.0.1/localhost 与 10./172.16-31./192.168. 私有网段且必须显式端口，
+        公网 http 一律拒绝；https 允许。对照开关（server_on）默认关，pull() 由该开关控制。
+        API 24+ 以本 XML 为准（AndroidManifest 的 usesCleartextTraffic 同步置 true）。
+    -->
+    <base-config cleartextTrafficPermitted="true">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>
     </base-config>
-    <!-- 仅本机 WSL/本地 FastAPI 对照服务允许明文；用户需在设置里显式开启对照开关 -->
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
 </network-security-config>

@@ -1,0 +1,248 @@
+"""数据库双向同步接口：GET /api/db/status、GET /api/db/export、POST /api/db/import。
+
+契约（与 Android / 前端组严格一致）：
+- 所有 ts 统一 UTC 毫秒整数。
+- export 的 5m/15m/30m/60m 只读手机上传的 kline_app 分表（源站段末口径），
+  服务端自身 kline_multi 是自然桶聚合口径，绝不导出给手机以免污染。
+- import 一律写 kline_app，不碰 kline_min/kline_day/kline_multi（既有接口零影响）。
+"""
+from __future__ import annotations
+
+import logging
+import math
+import time
+
+from fastapi import APIRouter, Query, Request
+from fastapi.responses import JSONResponse
+
+from . import store
+from .config import MULTI_PERIODS, PRODUCT_BY_CODE
+
+log = logging.getLogger("db_sync")
+
+router = APIRouter()
+
+# 八周期白名单（export / import 共用，与 main.APP_PERIODS 一致）
+_DB_PERIODS = ("1s", "30s", "1m", "5m", "15m", "30m", "60m", "1d")
+# 只读 kline_app 的四个多周期（源站段末口径）
+_APP_PERIODS = tuple(p for p, _ in MULTI_PERIODS)      # 5m/15m/30m/60m
+# 读取既有表全量的上限（既有表数据量有限：1m 源站上限约 1023 根）
+_ALL = 1_000_000
+
+_NOTE_STATUS = (
+    "ts 统一 UTC 毫秒整数；5m/15m/30m/60m 的导出来自手机上传的 kline_app "
+    "分表（源站段末口径），服务端自身 kline_multi 是自然桶聚合口径，"
+    "不导出给手机以免污染"
+)
+_NOTE_EMPTY_APP = "该周期服务端暂无手机上传的源站口径数据"
+_NOTE_IMPORT = (
+    "写入独立分表 kline_app（源站段末口径），不触碰 kline_min/kline_day/"
+    "kline_multi，既有接口零影响；主键 (code,period,ts) 幂等，重复上传净新增为 0"
+)
+
+
+def _finite(value):
+    """转有限浮点；None / bool / 非数 / NaN / inf 返回 None。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def _norm_bar(ts_ms, b):
+    """规整为 {ts(ms int),o,h,l,c,v}；ts 无效或收盘价非有限则丢弃该行。
+
+    o/h/l 缺失或非有限回退收盘价，v 缺失或非有限回退 0.0，
+    保证输出的 OHLC 一律为有限浮点、ts 一律为 int。
+    """
+    if ts_ms is None:
+        return None
+    c = _finite(b.get("c"))
+    if c is None:
+        return None
+    o = _finite(b.get("o"))
+    h = _finite(b.get("h"))
+    l = _finite(b.get("l"))
+    v = _finite(b.get("v"))
+    return {
+        "ts": int(ts_ms),
+        "o": o if o is not None else c,
+        "h": h if h is not None else c,
+        "l": l if l is not None else c,
+        "c": c,
+        "v": v if v is not None else 0.0,
+    }
+
+
+def _valid_code(code):
+    return code in PRODUCT_BY_CODE
+
+
+def _valid_period(period):
+    return period in _DB_PERIODS
+
+
+def _source_note(period):
+    if period == "1s":
+        return "1s 来自 snapshots 原始秒级点，OHLC 同值，ts 为毫秒整数"
+    if period == "30s":
+        return "30s 来自 snapshots 按 30 秒自然时间桶聚合，ts 为毫秒整数"
+    if period == "1m":
+        return "1m 来自 kline_min，字符串 ts 已统一转 UTC 毫秒整数"
+    if period == "1d":
+        return "1d 来自 kline_day，字符串 ts 已统一转 UTC 毫秒整数"
+    return (f"{period} 来自手机上传的 kline_app 分表（源站段末口径），"
+            "ts 为毫秒整数；服务端 kline_multi 自然桶聚合口径不导出")
+
+
+def _export_rows(code, period):
+    """按周期取数并规整为毫秒 ts + 有限 OHLC 的候选列表。"""
+    if period == "1s":
+        raw = store.snapshot_ohlc(code, _ALL)           # ts 已是毫秒整数
+        rows = [_norm_bar(b.get("ts"), b) for b in raw]
+    elif period == "30s":
+        pts = store.snapshot_ohlc(code, _ALL)
+        agg = store.aggregate_bars(pts, 30_000)         # 30 秒自然时间桶
+        rows = [_norm_bar(b.get("ts"), b) for b in agg]
+    elif period == "1m":
+        raw = store.get_minute(code, _ALL)              # ts 字符串
+        rows = [_norm_bar(store.bar_ts_ms(b.get("ts")), b) for b in raw]
+    elif period == "1d":
+        raw = store.get_daily(code, _ALL)               # ts 字符串
+        rows = [_norm_bar(store.bar_ts_ms(b.get("ts")), b) for b in raw]
+    else:  # 5m/15m/30m/60m：只读 kline_app
+        raw = store.get_app(code, period, _ALL)         # ts 毫秒整数
+        rows = [_norm_bar(b.get("ts"), b) for b in raw]
+    return [r for r in rows if r is not None]
+
+
+def _paginate(rows, since, limit):
+    """since 毫秒（严格大于）过滤 + 升序分页，返回 (bars, next_since, has_more)。"""
+    rows = sorted((r for r in rows if r["ts"] > since), key=lambda r: r["ts"])
+    page = rows[:limit + 1]
+    has_more = len(page) > limit
+    bars = page[:limit]
+    next_since = bars[-1]["ts"] if bars else since
+    return bars, next_since, has_more
+
+
+@router.get("/api/db/status")
+async def db_status(request: Request):
+    try:
+        data = store.db_status()
+        return {
+            "periods": data["periods"],
+            "app_table": data["app_table"],
+            "snapshots": data["snapshots"],
+            "ts": int(time.time() * 1000),
+            "server_version": request.app.version,
+            "note": _NOTE_STATUS,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.exception("db/status 失败")
+        return JSONResponse({"error": type(e).__name__}, status_code=500)
+
+
+@router.get("/api/db/export")
+async def db_export(code: str = Query("AL"),
+                    period: str = Query("1m"),
+                    since: int = Query(0),
+                    limit: int = Query(300)):
+    if not _valid_code(code) or not _valid_period(period):
+        return JSONResponse({"error": "invalid code or period"}, status_code=400)
+    since = max(0, int(since))
+    limit = max(1, min(300, int(limit)))
+    try:
+        rows = _export_rows(code, period)
+        bars, next_since, has_more = _paginate(rows, since, limit)
+        if period in _APP_PERIODS and not rows:
+            note = _NOTE_EMPTY_APP
+        else:
+            note = _source_note(period)
+        return {
+            "code": code,
+            "period": period,
+            "bars": bars,
+            "next_since": next_since,
+            "has_more": has_more,
+            "note": note,
+        }
+    except Exception as e:  # noqa: BLE001
+        log.exception("db/export 失败")
+        return JSONResponse({"error": type(e).__name__}, status_code=500)
+
+
+@router.post("/api/db/import")
+async def db_import(payload: dict):
+    try:
+        if not isinstance(payload, dict):
+            return JSONResponse({"ok": False, "error": "invalid body"},
+                                status_code=400)
+        code = payload.get("code")
+        period = payload.get("period")
+        if not _valid_code(code):
+            return JSONResponse({"ok": False, "error": "invalid code"},
+                                status_code=400)
+        if not _valid_period(period):
+            return JSONResponse({"ok": False, "error": "invalid period"},
+                                status_code=400)
+        bars = payload.get("bars")
+        if not isinstance(bars, list):
+            return JSONResponse({"ok": False, "error": "bars must be a list"},
+                                status_code=400)
+        if len(bars) > 300:
+            return JSONResponse({"ok": False, "error": "bars exceed 300"},
+                                status_code=400)
+        source = payload.get("source", "app")
+        source = source if isinstance(source, str) else "app"
+
+        upper = int(time.time() * 1000) + 86400_000
+        unique: dict[int, dict] = {}
+        for b in bars:
+            if not isinstance(b, dict):
+                return JSONResponse({"ok": False, "error": "invalid bar"},
+                                    status_code=400)
+            ts = b.get("ts")
+            if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                return JSONResponse({"ok": False, "error": "invalid ts"},
+                                    status_code=400)
+            ts_i = int(ts)
+            if ts_i <= 0 or ts_i >= upper:
+                return JSONResponse({"ok": False, "error": "invalid ts"},
+                                    status_code=400)
+            c = _finite(b.get("c"))
+            if c is None:
+                return JSONResponse({"ok": False, "error": "invalid OHLC"},
+                                    status_code=400)
+            vals = {}
+            for key in ("o", "h", "l", "v"):
+                raw = b.get(key)
+                if raw is None:
+                    vals[key] = None                 # 缺失回退
+                else:
+                    f = _finite(raw)
+                    if f is None:
+                        return JSONResponse(
+                            {"ok": False, "error": "invalid OHLC"},
+                            status_code=400)
+                    vals[key] = f
+            unique[ts_i] = {
+                "ts": ts_i,
+                "o": vals["o"] if vals["o"] is not None else c,
+                "h": vals["h"] if vals["h"] is not None else c,
+                "l": vals["l"] if vals["l"] is not None else c,
+                "c": c,
+                "v": vals["v"] if vals["v"] is not None else 0.0,
+            }
+
+        added, total = store.upsert_app(code, period, list(unique.values()),
+                                        source)
+        return {"ok": True, "added": added, "total": total,
+                "note": _NOTE_IMPORT}
+    except Exception as e:  # noqa: BLE001
+        log.exception("db/import 失败")
+        return JSONResponse({"ok": False, "error": type(e).__name__},
+                            status_code=500)

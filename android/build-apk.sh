@@ -66,7 +66,7 @@ if [ ! -f "$KEYSTORE" ]; then
     -dname "CN=Futures Forecast, OU=Personal, O=zpj100, L=China, ST=China, C=CN"
 fi
 
-VERSION="$(grep -m1 "versionName" "$ROOT/android/app/build.gradle" | sed -E "s/.*versionName[[:space:]]*'([^']+)'.*/\1/")"
+VERSION="$(grep -m1 "versionName" "$ROOT/android/app/build.gradle" | sed -E "s/.*versionName[[:space:]]*[\"']([^\"']+)[\"'].*/\1/")"
 echo "==> building v$VERSION"
 
 cd "$ROOT/android"

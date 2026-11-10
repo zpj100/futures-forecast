@@ -12,6 +12,7 @@ import com.zpj.futures.data.Engine;
 import com.zpj.futures.data.Products;
 import com.zpj.futures.data.SinaClient;
 import com.zpj.futures.db.Bar;
+import com.zpj.futures.db.SeedImporter;
 import com.zpj.futures.db.Store;
 import com.zpj.futures.quant.Forecaster;
 import com.zpj.futures.update.Updater;
@@ -21,10 +22,13 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -205,6 +209,229 @@ public class Bridge {
         return store.stats().toString();
     }
 
+    // ---------------- 本地库诊断 / 双端导出导入 / 重建（v2.6.0） ----------------
+
+    /** 品种白名单（与 Products.CODES 一致）。 */
+    private static boolean codeAllowed(String c) {
+        if (c == null) return false;
+        for (String x : Products.CODES) if (x.equals(c)) return true;
+        return false;
+    }
+
+    private static boolean isFinite(double v) {
+        return !Double.isNaN(v) && !Double.isInfinite(v);
+    }
+
+    /** JSON 里不能有 NaN/Inf；导出时兜底成 0。 */
+    private static double fin(double v) {
+        return isFinite(v) ? v : 0.0;
+    }
+
+    /**
+     * 本地库诊断快照。periods 覆盖三品种 × 六周期，legacy 为 5m/15m/30m/60m
+     * 旧口径残留行数（1m/1d 恒为 0）；ticks 为秒级总体 n/min/max。
+     */
+    @JavascriptInterface
+    public String localDbStatus() {
+        JSONObject o = new JSONObject();
+        try {
+            JSONObject stats = store.klineStats();
+            JSONObject legacy = store.countLegacyBars();
+            int legacyTotal = 0;
+            Iterator<String> it = legacy.keys();
+            while (it.hasNext()) legacyTotal += legacy.optInt(it.next(), 0);
+
+            JSONObject periods = new JSONObject();
+            for (String code : Products.CODES) {
+                for (String period : Engine.PERIODS) {
+                    String key = code + "|" + period;
+                    JSONObject s = stats.optJSONObject(key);
+                    JSONObject one = new JSONObject();
+                    one.put("n", s != null ? s.optInt("n", 0) : 0);
+                    one.put("min", s != null ? s.optLong("min", 0) : 0);
+                    one.put("max", s != null ? s.optLong("max", 0) : 0);
+                    one.put("legacy", legacy.optInt(key, 0));
+                    periods.put(key, one);
+                }
+            }
+            o.put("periods", periods);
+            o.put("ticks", store.tickStats());
+            o.put("last_sync", cfg.lastSync());
+            o.put("pending", pendingBarCount());
+            o.put("seed_version", cfg.seedVersion());
+            boolean migrated = prefs().getBoolean("db_migrated_260", false);
+            o.put("migrated", migrated);
+            o.put("note", buildDbNote(legacyTotal, migrated,
+                    prefs().getInt("db_migrated_rows", 0)));
+        } catch (Exception e) {
+            try {
+                o.put("error", Cfg.redact(brief(e)));
+            } catch (Exception ignored) {
+            }
+        }
+        return o.toString();
+    }
+
+    /** 从 ff_cfg/sync_pending 统计待续跑的 bar 总数（失败批 JSON 里的 bars 行数之和）。 */
+    private int pendingBarCount() {
+        try {
+            String raw = prefs().getString("sync_pending", "");
+            if (raw == null || raw.isEmpty()) return 0;
+            JSONObject root = new JSONObject(raw);
+            JSONArray batches = root.optJSONArray("batches");
+            if (batches == null) return 0;
+            int n = 0;
+            for (int i = 0; i < batches.length(); i++) {
+                JSONObject b = batches.optJSONObject(i);
+                if (b == null) continue;
+                JSONArray bars = b.optJSONArray("bars");
+                if (bars != null) n += bars.length();
+            }
+            return n;
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private String buildDbNote(int legacyTotal, boolean migrated, long migratedRows) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("periods 覆盖三品种×六周期；legacy 为 5m/15m/30m/60m 旧口径残留行数"
+                + "（1m/1d 不参与迁移）；ts 统一 UTC 毫秒整数");
+        if (migrated) {
+            if (migratedRows >= 0) {
+                sb.append("；旧口径已迁移（删除 ").append(migratedRows).append(" 行）");
+            } else {
+                sb.append("；旧口径迁移未完成（可重建本地库重试）");
+            }
+        } else {
+            sb.append("；旧口径迁移尚未执行");
+        }
+        sb.append("；当前旧口径残留 ").append(legacyTotal).append(" 行");
+        return sb.toString();
+    }
+
+    /**
+     * 导出本地 K 线供服务端同步。since 毫秒（严格大于，0=全部），ts 升序，
+     * limit clamp 1..300；period 白名单六周期；非法返回 {"error":"..."}。
+     */
+    @JavascriptInterface
+    public String exportBars(String code, String period, long since, int limit) {
+        if (closed) return errJson("桥已关闭");
+        if (!codeAllowed(code)) return errJson("非法的品种代码");
+        if (!periodAllowed(period)) return errJson("非法的周期");
+        int lim = Math.max(1, Math.min(300, limit));
+        long s = Math.max(0L, since);
+        try {
+            List<Bar> rows = store.klinesSince(code, period, s, lim + 1);
+            boolean hasMore = rows.size() > lim;
+            if (hasMore) rows = rows.subList(0, lim);
+            JSONArray arr = new JSONArray();
+            long last = s;
+            for (Bar b : rows) {
+                JSONObject ob = new JSONObject();
+                ob.put("ts", b.ts);
+                ob.put("o", fin(b.o));
+                ob.put("h", fin(b.h));
+                ob.put("l", fin(b.l));
+                ob.put("c", fin(b.c));
+                ob.put("v", fin(b.v));
+                arr.put(ob);
+                last = b.ts;
+            }
+            JSONObject res = new JSONObject();
+            res.put("code", code);
+            res.put("period", period);
+            res.put("bars", arr);
+            res.put("next_since", last);
+            res.put("has_more", hasMore);
+            return res.toString();
+        } catch (Exception e) {
+            return errJson(Cfg.redact(brief(e)));
+        }
+    }
+
+    /**
+     * 导入 bars 数组 JSON 到本地库，返回净新增根数；失败返回 -1。
+     * 校验 code/period、bars≤300、ts>0 且 < now+1 天、OHLC 有限；走 Store.upsertKlines。
+     */
+    @JavascriptInterface
+    public int importBars(String code, String period, String barsJson) {
+        if (closed || !codeAllowed(code) || !periodAllowed(period)) return -1;
+        try {
+            JSONArray arr = new JSONArray(barsJson == null ? "[]" : barsJson);
+            if (arr.length() > 300) return -1;
+            long upper = System.currentTimeMillis() + 86400_000L;
+            List<Bar> bars = new ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject b = arr.optJSONObject(i);
+                if (b == null) return -1;
+                long ts = b.optLong("ts", 0);
+                if (ts <= 0 || ts >= upper) return -1;
+                double c = b.optDouble("c", Double.NaN);
+                if (!isFinite(c)) return -1;
+                double o = b.optDouble("o", c);
+                double h = b.optDouble("h", c);
+                double l = b.optDouble("l", c);
+                double v = b.optDouble("v", 0.0);
+                if (!isFinite(o) || !isFinite(h) || !isFinite(l) || !isFinite(v)) return -1;
+                bars.add(new Bar(ts, o, h, l, c, v));
+            }
+            if (bars.isEmpty()) return 0;
+            int before = store.countKline(code, period);
+            store.upsertKlines(code, period, bars);
+            return store.countKline(code, period) - before;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /**
+     * 重建本地库：后台线程清空 kline（保留 ticks/forecasts）→ 强制重新导入 seed.db
+     * → engine.reloadCaches() → 触发一次前端刷新。逐阶段 emit onDbRebuild。
+     * 与 syncHistory 共用 Engine 的 dbBusy 互斥，不阻塞 UI。
+     */
+    @JavascriptInterface
+    public void rebuildLocalDb() {
+        pool.execute(() -> {
+            if (!engine.tryAcquireDb()) {
+                emitRebuild("error", "数据库忙：同步或重建进行中", 0, 0);
+                return;
+            }
+            try {
+                emitRebuild("start", "清空本地 K 线（保留秒级与预测）…", 0, 0);
+                store.clearKline();
+                emitRebuild("step", "重置预置库版本并重新导入 seed.db…", 35, 0);
+                cfg.setSeedVersion(0L);   // 绕过 importIfNeeded 的 seedVersion 跳过
+                int rows = SeedImporter.importIfNeeded(ctx, cfg, store);
+                if (rows < 0) {
+                    emitRebuild("error", "预置库重新导入失败", 0, 0);
+                    return;
+                }
+                emitRebuild("step", "重新装载各周期缓存…", 75, rows);
+                engine.reloadCaches();
+                emitRebuild("done", "本地库已重建 · 共 " + rows + " 根 K 线", 100, rows);
+                emit("onData", "");       // 触发一次前端刷新（window.FF.onData）
+            } catch (Exception e) {
+                emitRebuild("error", Cfg.redact(brief(e)), 0, 0);
+            } finally {
+                engine.releaseDb();
+            }
+        });
+    }
+
+    /** onDbRebuild 回调：phase = start|step|done|error，pct 0..100，rows 行数。 */
+    private void emitRebuild(String phase, String msg, int pct, int rows) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("phase", phase);
+            o.put("msg", Cfg.redact(msg == null ? "" : msg));
+            o.put("pct", Math.max(0, Math.min(100, pct)));
+            o.put("rows", rows);
+        } catch (Exception ignored) {
+        }
+        emit("onDbRebuild", o.toString());
+    }
+
     @JavascriptInterface
     public void clearForecasts() {
         store.clearForecasts();
@@ -224,8 +451,9 @@ public class Bridge {
     }
 
     private void syncHistory0(final boolean force) {
-        if (engine.isSyncing()) {
-            emit("onToast", q("同步正在进行中，请稍候"));
+        if (engine.isSyncing() || engine.isDbBusy()) {
+            emit("onToast", q(engine.isDbBusy() && !engine.isSyncing()
+                    ? "数据库忙：重建进行中，请稍候" : "同步正在进行中，请稍候"));
             return;
         }
         emit("onToast", q(force
@@ -466,22 +694,27 @@ public class Bridge {
     @JavascriptInterface
     public void setServer(String base, boolean on) {
         SharedPreferences sp = prefs();
-        if (!on) {
-            sp.edit().putBoolean("server_on", false).apply();
-            return;
-        }
         String b = base == null ? "" : base.trim();
-        if (!isValidServerBase(b)) {
-            throw new IllegalArgumentException(
-                    "服务端地址不合法：仅允许 http://127.0.0.1:PORT、http://localhost:PORT，"
-                            + "或显式开启的 https 主机 / 私有网段 IPv4；禁止 userinfo 与路径穿越");
+        if (!b.isEmpty()) {
+            // 允许「只配置地址、不开对照开关」（数据库同步用），地址仍必须通过白名单校验
+            if (!isValidServerBase(b)) {
+                throw new IllegalArgumentException(
+                        "服务端地址不合法：仅允许 http://127.0.0.1:PORT、http://localhost:PORT，"
+                                + "或显式开启的 https 主机 / 私有网段 IPv4；禁止 userinfo 与路径穿越");
+            }
+            sp.edit().putString("server_base", b).apply();
+        } else if (on) {
+            throw new IllegalArgumentException("服务端地址不能为空");
         }
-        sp.edit().putString("server_base", b).putBoolean("server_on", true).apply();
+        sp.edit().putBoolean("server_on", on).apply();
     }
 
     /**
      * GET base+path，超时 5 秒，返回响应体；失败返回 {@code {"error":"<脱敏原因>"}}。
      * path 必须匹配 {@code ^/api/[A-Za-z0-9/_.?=&%\-]*$}。
+     *
+     * <p>v2.6.0 前置条件：只要求 server_base 已配置且合法，不再要求 server_on=true。
+     * 对照开关（server_on）仅由前端 pull() 决定是否调用本方法（默认关）。
      */
     @JavascriptInterface
     public String serverGet(String path) {
@@ -490,7 +723,6 @@ public class Bridge {
             return errJson("非法的请求路径");
         }
         SharedPreferences sp = prefs();
-        if (!sp.getBoolean("server_on", false)) return errJson("服务端对照开关未开启");
         String base = sp.getString("server_base", "");
         if (base == null || base.isEmpty() || !isValidServerBase(base)) {
             return errJson("服务端地址未配置或不合法");
@@ -513,20 +745,74 @@ public class Bridge {
         }
     }
 
+    /**
+     * POST base+path，application/json，超时 10 秒，body ≤256KB；失败返回
+     * {@code {"error":"<脱敏>"}}。前置条件与 serverGet 一致：只要求 server_base
+     * 已配置且合法（不要求 server_on）；路径白名单与地址白名单完全复用。
+     */
+    @JavascriptInterface
+    public String serverPost(String path, String body) {
+        if (closed) return errJson("桥已关闭");
+        if (path == null || !SERVER_PATH.matcher(path).matches()) {
+            return errJson("非法的请求路径");
+        }
+        byte[] payload = (body == null ? "" : body).getBytes(StandardCharsets.UTF_8);
+        if (payload.length > 256 * 1024) return errJson("请求体过大（超过 256KB）");
+        SharedPreferences sp = prefs();
+        String base = sp.getString("server_base", "");
+        if (base == null || base.isEmpty() || !isValidServerBase(base)) {
+            return errJson("服务端地址未配置或不合法");
+        }
+        java.util.concurrent.Callable<String> task = () -> doServerPost(base, path, body);
+        Future<String> f;
+        try {
+            f = pool.submit(task);
+        } catch (Exception e) {
+            return errJson("桥已关闭");
+        }
+        try {
+            return f.get(10, TimeUnit.SECONDS);   // 不阻塞超过 10 秒
+        } catch (TimeoutException te) {
+            f.cancel(true);
+            return errJson("服务端请求超时（10 秒）");
+        } catch (Exception e) {
+            return errJson(Cfg.redact(brief(e)));
+        }
+    }
+
     private String doServerGet(String base, String path) {
+        return doServer(base, path, "GET", null, 4500, 4500);
+    }
+
+    private String doServerPost(String base, String path, String body) {
+        return doServer(base, path, "POST", body == null ? "" : body, 9500, 9500);
+    }
+
+    /** GET / POST 共用的连接配置与脱敏逻辑（v2.6.0）：POST 写 application/json 请求体。 */
+    private String doServer(String base, String path, String method,
+                            String body, int connectTimeout, int readTimeout) {
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL(base + path).openConnection();
-            c.setConnectTimeout(4500);
-            c.setReadTimeout(4500);
+            c.setConnectTimeout(connectTimeout);
+            c.setReadTimeout(readTimeout);
             c.setInstanceFollowRedirects(false);
-            c.setRequestMethod("GET");
+            c.setRequestMethod(method);
             c.setRequestProperty("Accept", "application/json, */*");
+            if ("POST".equals(method)) {
+                byte[] out = body.getBytes(StandardCharsets.UTF_8);
+                c.setDoOutput(true);
+                c.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+                c.setFixedLengthStreamingMode(out.length);
+                try (OutputStream os = c.getOutputStream()) {
+                    os.write(out);
+                }
+            }
             int code = c.getResponseCode();
             InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-            String body = drain(in);
+            String resp = drain(in);
             if (code >= 400) return errJson("HTTP " + code);
-            return body.isEmpty() ? "{}" : body;
+            return resp.isEmpty() ? "{}" : resp;
         } catch (Exception e) {
             return errJson(Cfg.redact(brief(e)));
         } finally {

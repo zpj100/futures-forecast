@@ -706,3 +706,30 @@ html.light .lm-t { color: #16324f; }
   word-break: break-word;
 }
 .server-compare[hidden] { display: none; }
+
+/* ---------- 数据库同步（设置页） ---------- */
+.db-diag-title {
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--muted);
+  letter-spacing: .04em;
+}
+.db-diag {
+  margin-top: 6px;
+  border: 1px dashed var(--line2);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: var(--inner);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.75;
+  color: var(--muted);
+  word-break: break-word;
+  max-height: 280px;
+  overflow: auto;
+}
+.db-diag b { color: var(--text); font-weight: 600; }
+.db-diag .dg-warn { color: var(--up); }
+.db-diag .dg-ok { color: var(--down); }
+/* 与 upd/sync/pred 进度条右侧百分比保持一致（新增，不改已有规则） */
+.prog-meta #dbProgPct { flex: 0 0 auto; margin-left: 10px; color: var(--text); }

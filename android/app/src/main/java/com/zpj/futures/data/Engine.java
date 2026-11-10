@@ -86,6 +86,8 @@ public class Engine {
     private static final String PREF_SYNC_PENDING = "sync_pending";
 
     private final AtomicBoolean syncing = new AtomicBoolean(false);
+    /** v2.6.0：syncHistory 与 Bridge.rebuildLocalDb 共用「数据库忙」标志，保证互斥。 */
+    private final AtomicBoolean dbBusy = new AtomicBoolean(false);
 
     public Engine(Context ctx, Cfg cfg) {
         this.ctx = ctx.getApplicationContext();
@@ -100,6 +102,17 @@ public class Engine {
     public void start() {
         if (started) return;
         started = true;
+        // v2.6.0：旧口径（1m 派生自然桶起点 ts）自动迁移，只跑一次；
+        // 必须在 reloadCaches() 之前，确保缓存装载的是清理后的库。
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences("ff_cfg", Context.MODE_PRIVATE);
+            if (!sp.getBoolean("db_migrated_260", false)) {
+                int rows = store.migrateLegacyBars(ctx);
+                sp.edit().putBoolean("db_migrated_260", true)
+                        .putInt("db_migrated_rows", rows).apply();
+            }
+        } catch (Exception ignored) {
+        }
         // 先用库里的历史填充缓存，保证断网也有曲线
         reloadCaches();
         lastTick = store.lastTickTs("AL");
@@ -473,16 +486,31 @@ public class Engine {
         return syncing.get();
     }
 
+    /** 供 syncHistory 与 Bridge.rebuildLocalDb 共用的「数据库忙」互斥锁。 */
+    public boolean tryAcquireDb() {
+        return dbBusy.compareAndSet(false, true);
+    }
+
+    public void releaseDb() {
+        dbBusy.set(false);
+    }
+
+    public boolean isDbBusy() {
+        return dbBusy.get();
+    }
+
     public JSONObject syncHistory(SyncListener cb) {
         return syncHistory(cb, false);
     }
 
     /**
-     * 同步历史数据：**体检 → 构建分批 → 分批回补（失败批续跑）**（v2.4.0+）。
+     * 同步历史数据：**体检 → 构建分批 → 分批回补（失败批续跑）**（v2.6.0）。
      *
-     * <p>体检把源站返回的序列当基准逐根比对本地时间戳：源站有、本地没有 = 缺失。
-     * 日线体检基准为 {@link #DAILY_DAYS} 天，分钟线为 {@link #CHECK_DAYS} 天；
-     * 窗口为空的周期不参与回补。
+     * <p>回补基准是「源站返回的整段序列」：日线用 {@link #DAILY_DAYS} 天内、
+     * 分钟线用源站可给的整段序列（5m≈15 天 / 15m≈2 月 / 30m≈3 月 / 60m≈6 月、
+     * 1m 上限 1023 根）。analyze() 仍按 {@link #CHECK_DAYS} 天窗口做体检并产出
+     * check 报告，但 buildBatches() 收集的是 j.bars <b>全部</b> 中「本地没有的 ts」，
+     * 不再受 7 天窗口限制（v2.4 只补 7 天窗口导致 5m/15m/30m/60m 永远 0 根）。
      *
      * <p>回补把「待写入的缺失 bar」按「品种×周期」顺序切成每批 ≤{@link #MAX_BATCH} 根，
      * 批间限速 ~200ms，逐批写回且**只写源站有而本地缺的那些 ts**（不整窗 REPLACE，
@@ -491,22 +519,23 @@ public class Engine {
      * 重复同步幂等：无缺失时零新增。
      *
      * <p>分钟各周期 ts 以源站段末为唯一口径（见 {@link #incrementalMinute(boolean)}）；
-     * 1m 源站上限 1023 根、仅覆盖约 2 交易日，7 天前不补、不插值、不伪造，
-     * coverage 逐周期给真实起点。
+     * coverage 逐周期给真实起点。与 rebuildLocalDb 共用 dbBusy 互斥。
      *
      * @param forceFull true 仅作「强制体检」标记，不改变「只补缺」的写入口径
      *                  （不会退化成整段重写 180 天日线）
      */
     public JSONObject syncHistory(SyncListener cb, boolean forceFull) {
         JSONObject res = new JSONObject();
-        if (!syncing.compareAndSet(false, true)) {
+        // 与 rebuildLocalDb 共用同一把「数据库忙」锁，二者互斥
+        if (!tryAcquireDb()) {
             try {
                 res.put("ok", false);
-                res.put("message", "同步正在进行中");
+                res.put("message", "数据库忙：同步或重建进行中");
             } catch (Exception ignored) {
             }
             return res;
         }
+        syncing.set(true);
         long now = System.currentTimeMillis();
         long dailyCut = now - DAILY_DAYS * 86400_000L;
         long checkCut = now - CHECK_DAYS * 86400_000L;
@@ -611,6 +640,23 @@ public class Engine {
                 coverage.put(k, store.firstKlineTsSince(j.code, j.period, 0L));
             }
 
+            // v2.6.0：整段序列（非 7 天体检查窗口）作为回补基准的统计
+            int fullWindowBars = 0;
+            for (Job j : jobs) fullWindowBars += (j.bars == null ? 0 : j.bars.size());
+            // 覆盖周期数：实际有写入的不同周期类型数；per_period 汇总各周期写入根数
+            Set<String> covered = new HashSet<>();
+            JSONObject perPeriod = new JSONObject();
+            for (Map.Entry<String, Integer> e : wrotePerKey.entrySet()) {
+                int v = e.getValue();
+                if (v <= 0) continue;
+                String k = e.getKey();
+                int bar = k.indexOf('|');
+                String p = bar >= 0 ? k.substring(bar + 1) : k;
+                covered.add(p);
+                perPeriod.put(p, perPeriod.optInt(p, 0) + v);
+            }
+            int coveredPeriods = covered.size();
+
             // ---------- 阶段 3：秒级校验 + 刷新缓存 + 统计 ----------
             if (cb != null) cb.onStep("校验秒级快照 · 刷新本地缓存…", totalSteps, totalSteps);
             JSONObject ticks = checkTicks();
@@ -632,23 +678,30 @@ public class Engine {
             check.put("pending_retried", pending.size());
             check.put("forced", forceFull);
             check.put("incremental", wroteBars);
+            check.put("full_window_bars", fullWindowBars);   // 整段序列源站 bars 总数（非 7 天窗口）
+            check.put("repaired_bars", wroteBars);           // 本次实际写入根数
+            check.put("per_period", perPeriod);              // 各周期写入根数
 
             String base = summary(periods, now, wroteBars);
+            // message / head 明确写出「本次写入 N 根 / 覆盖 M 个周期」
+            String cnt = "本次写入 " + wroteBars + " 根 / 覆盖 " + coveredPeriods + " 个周期 · ";
             String head;
-            if (forceFull) head = "强制体检（仅补缺，不整段重写）· ";
-            else if (missing > 0 || cleared > 0) {
-                head = "体检回补 " + wroteBars + " 根 / " + healedItems + " 组 · ";
-            } else head = "体检无缺失 · ";
+            if (forceFull) head = "强制体检（仅补缺）· " + cnt;
+            else if (missing > 0 || cleared > 0) head = "体检回补 · " + cnt;
+            else head = "体检（近 " + CHECK_DAYS + " 天无缺失）· " + cnt;
             String msg = head + base;
 
             long cov1m = minCoverage(coverage, "|1m");
             String note = "分钟线近 " + CHECK_DAYS + " 天、日线回溯 " + DAILY_DAYS
-                    + " 天体检并增量同步；各分钟周期以源站段末 ts 为唯一落库口径"
-                    + "；1m 源站上限 1023 根，仅覆盖约 2 交易日（7 天前不补、不插值、不伪造）"
-                    + "；5m/15m/30m/60m 近 7 天窗口可补满"
+                    + " 天体检；回补按源站整段序列（5m/15m/30m/60m 补到源站可给的最长历史、1d 补 "
+                    + DAILY_DAYS + " 天、1m 上限 1023 根）；各分钟周期以源站段末 ts 为唯一落库口径"
+                    + "；1m 源站约 2 交易日，不插值、不伪造"
                     + "；秒级仅本机采集（最近 30 分钟 " + ticks.optInt("points", 0)
                     + " 点），公开源不提供历史秒级，无法回溯补齐";
             if (cov1m > 0) note += "；1 分钟线实际覆盖起点 " + dayStr(cov1m);
+            if (wroteBars == 0) {
+                note += "；本地已与源站可给窗口一致；源站 1m 上限 1023 根约 2 交易日，更早历史请从服务端同步";
+            }
 
             res.put("ok", true);
             res.put("fetched", wroteBars);
@@ -678,6 +731,7 @@ public class Engine {
             }
         } finally {
             syncing.set(false);
+            releaseDb();
         }
         return res;
     }
@@ -747,9 +801,9 @@ public class Engine {
     }
 
     /**
-     * 构建回补批次：把「上次失败批」与「本次各周期窗口内源站 bars」按 (code,period,ts)
+     * 构建回补批次：把「上次失败批」与「本次各周期源站整段序列 j.bars」按 (code,period,ts)
      * 去重汇总，再过滤出「本地确实没有」的 ts，最后按 品种×周期 顺序切成 ≤MAX_BATCH 的批次。
-     * 只写本地缺的 ts，不整窗 REPLACE。
+     * 只写本地缺的 ts，不整窗 REPLACE。回补基准是整段序列而非 7 天体检查窗口（v2.6.0）。
      */
     private List<Batch> buildBatches(List<Job> jobs, List<Batch> pending) {
         Map<String, TreeMap<Long, Bar>> byKey = new LinkedHashMap<>();
@@ -760,11 +814,13 @@ public class Engine {
             if (t == null) continue;
             for (Bar bar : b.bars) if (bar.ts > 0) t.put(bar.ts, bar);
         }
-        // 2) 本次窗口内源站 bars（窗口为空的周期不 heal）
+        // 2) 本次源站返回的「整段序列」j.bars（不再限于 7 天体检查窗口）：
+        //    5m/15m/30m/60m 补到源站可给的最长历史、1d 已是 180 天窗口、1m 上限 1023 根。
+        //    j.window 只用于 analyze() 的 7 天体检报告，不参与回补。
         for (Job j : jobs) {
-            if (j.window == null || j.window.isEmpty()) continue;
+            if (j.bars == null || j.bars.isEmpty()) continue;
             TreeMap<Long, Bar> t = byKey.get(j.code + "|" + j.period);
-            for (Bar bar : j.window) if (bar.ts > 0) t.put(bar.ts, bar);
+            for (Bar bar : j.bars) if (bar.ts > 0) t.put(bar.ts, bar);
         }
         List<Batch> out = new ArrayList<>();
         for (Job j : jobs) {

@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import collector, store
+from . import db_sync
 from .config import (APP_HORIZONS, HORIZONS, MULTI_PERIODS, PRODUCTS,
                      PRODUCT_BY_CODE, STATIC_DIR)
 from .datasource.http_util import close_client
@@ -49,6 +50,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="铝期货趋势预测", version="1.0.0", lifespan=lifespan)
+
+# 数据库双向同步接口（/api/db/*），独立分表 kline_app，不影响既有路由。
+app.include_router(db_sync.router)
 
 
 @app.get("/api/health")

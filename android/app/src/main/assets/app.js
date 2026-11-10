@@ -30,6 +30,16 @@
       on: false, base: 'http://127.0.0.1:8000', snap: null,
       bars: [], snapCode: '', snapPeriod: '', lastBarTs: 0,
       ts: 0, version: '', compareText: '', failUntil: 0
+    },
+    // 数据库同步（手机 ↔ 服务端）：base 持久化到 localStorage，busy 防并发
+    db: {
+      busy: false,
+      base: (function () {
+        try { return localStorage.getItem('ff_db_base') || 'http://127.0.0.1:8000'; }
+        catch (e) { return 'http://127.0.0.1:8000'; }
+      })(),
+      failedBatches: 0,
+      warns: []
     }
   };
 
@@ -1118,6 +1128,429 @@
     } catch (e2) { /* ignore */ }
   }
 
+  // ---------------- 数据库同步（手机 ↔ 服务端） ----------------
+
+  var DB_CODES = ['AL', 'AO', 'AHD'];
+  var DB_DOWN_PERIODS = ['1s', '30s', '1m', '5m', '15m', '30m', '60m', '1d'];
+  var DB_UP_PERIODS = ['1m', '5m', '15m', '30m', '60m', '1d'];
+  var DB_LIMIT = 300;
+  var DB_MAX_BATCH = 30;
+  var DB_HINT = '请确认：① 服务端以 0.0.0.0 启动；② Windows 已配置端口转发（netsh interface portproxy）；'
+    + '③ 手机与电脑在同一局域网；④ 地址填 http://<电脑局域网IP>:8000'
+    + '（WSL 本机或预览用 http://127.0.0.1:8000）。';
+
+  /** 把 Native 抛出的异常/错误串转成可操作提示（地址非法 / 超时 / 拒绝连接）。 */
+  function dbHint(e) {
+    var m = (e && e.message) ? e.message : String(e == null ? '' : e);
+    var low = m.toLowerCase();
+    if (/timed?[ -]?out|timeout|超时|socket/.test(low)) {
+      return m + '（连接超时：' + DB_HINT + '）';
+    }
+    if (/refused|unreachable|econn|connect|failed|无法连接|拒绝|host/.test(low)) {
+      return m + '（无法连接：' + DB_HINT + '）';
+    }
+    if (/invalid|illegal|not allowed|非法|地址|scheme/.test(low)) {
+      return m + '（地址非法：需为 http://<私有网段IP>:8000 或 http://127.0.0.1:8000）';
+    }
+    return m;
+  }
+
+  /** 统一 JSON 解析：解析失败 / {"error":...} / 空响应都归一成 {__err} 失败对象。 */
+  function dbJson(raw, what) {
+    var o;
+    try { o = JSON.parse(raw); } catch (e) {
+      return { __err: (what || '响应') + '不是合法 JSON：' + ((e && e.message) || e) };
+    }
+    if (!o || typeof o !== 'object') return { __err: (what || '响应') + '为空或格式异常' };
+    if (o.error) return { __err: String(o.error) };
+    return o;
+  }
+
+  function dbGet(path) {
+    if (!N || typeof N.serverGet !== 'function') return { __err: '当前环境不支持 Native.serverGet' };
+    var raw;
+    try { raw = N.serverGet(path); } catch (e) { return { __err: dbHint(e) }; }
+    return dbJson(raw, '服务端响应');
+  }
+
+  function dbPost(path, body) {
+    if (!N || typeof N.serverPost !== 'function') return { __err: '当前环境不支持 Native.serverPost' };
+    var raw;
+    try { raw = N.serverPost(path, body); } catch (e) { return { __err: dbHint(e) }; }
+    return dbJson(raw, '服务端响应');
+  }
+
+  function dbLocal() {
+    if (!N || typeof N.localDbStatus !== 'function') return { __err: '当前环境不支持 Native.localDbStatus' };
+    var raw;
+    try { raw = N.localDbStatus(); } catch (e) { return { __err: dbHint(e) }; }
+    return dbJson(raw, '本地库状态');
+  }
+
+  function dbExport(code, period, since, limit) {
+    if (!N || typeof N.exportBars !== 'function') return { __err: '当前环境不支持 Native.exportBars' };
+    var raw;
+    try { raw = N.exportBars(code, period, since, limit); } catch (e) { return { __err: dbHint(e) }; }
+    return dbJson(raw, '本地导出');
+  }
+
+  /** 返回净新增根数；-1 表示失败或 Native 返回异常。 */
+  function dbImport(code, period, bars) {
+    if (!N || typeof N.importBars !== 'function') return -1;
+    try {
+      var n = N.importBars(code, period, JSON.stringify(bars));
+      return (typeof n === 'number' && isFinite(n)) ? n : (Number(n) || 0);
+    } catch (e) { return -1; }
+  }
+
+  /** 配置 Native 服务端地址；on 绝不为同步把对照开关打开。 */
+  function dbApplyBase(base, on) {
+    if (!N || typeof N.setServer !== 'function') return '当前环境不支持 Native.setServer';
+    try { N.setServer(base, on); return null; } catch (e) { return dbHint(e); }
+  }
+
+  /** 同步 / 测试结束后把 Native 的 base、对照开关还原成前端设置，避免污染对照取数。 */
+  function dbRestoreServer() {
+    if (N && typeof N.setServer === 'function') {
+      try { N.setServer(S.server.base, S.server.on); } catch (e) { /* ignore */ }
+    }
+  }
+
+  function dbBaseValue() {
+    var el = $('#dbServerBase');
+    var v = el ? String(el.value || '').trim() : '';
+    return v || S.db.base;
+  }
+
+  function saveDbBase() {
+    S.db.base = dbBaseValue();
+    try { localStorage.setItem('ff_db_base', S.db.base); } catch (e) { /* ignore */ }
+  }
+
+  function dbInfo(text, cls) {
+    var el = $('#dbInfo');
+    if (!el) return;
+    el.className = 'server-state' + (cls ? ' ' + cls : '');
+    el.textContent = text;
+  }
+
+  function setDbButtons(busy) {
+    ['#btnDbSync', '#btnDbTest', '#btnDbRebuild'].forEach(function (sel) {
+      var b = $(sel);
+      if (b) b.disabled = busy;
+    });
+    var sync = $('#btnDbSync');
+    if (sync) sync.textContent = busy ? '同步中…' : '与服务端同步';
+  }
+
+  /** 测试连接：只配地址、不开对照 → 取 /api/db/status → 显示三品种各周期根数。 */
+  function dbTest() {
+    if (S.db.busy) return;
+    if (DEMO || !N) { dbInfo('演示模式（浏览器预览）不支持数据库测试连接', 'err'); return; }
+    progHide('#dbProgWrap');
+    saveDbBase();
+    var base = S.db.base;
+    var e0 = dbApplyBase(base, false);
+    if (e0) {
+      dbRestoreServer();
+      dbInfo('地址无效或无法保存：' + e0 + '\n' + DB_HINT, 'err');
+      return;
+    }
+    dbInfo('正在测试连接 ' + base + ' …', '');
+    var r = dbGet('/api/db/status');
+    dbRestoreServer();
+    if (r.__err) { dbInfo('连接失败：' + r.__err + '\n' + DB_HINT, 'err'); return; }
+    var periods = r.periods || {};
+    var lines = ['已连接 · 服务端 /api/db/status（ts ' + (r.ts || '—') + '）'];
+    DB_CODES.forEach(function (code) {
+      var parts = [];
+      DB_DOWN_PERIODS.forEach(function (p) {
+        var v = periods[code + '|' + p] || periods[p];
+        parts.push(p + ':' + (v && v.n !== undefined ? v.n : '—'));
+      });
+      lines.push(code + '  ' + parts.join(' '));
+    });
+    if (r.app_table) {
+      try { lines.push('app_table：' + JSON.stringify(r.app_table)); } catch (e) { /* ignore */ }
+    }
+    if (r.note) lines.push('note：' + String(r.note));
+    dbInfo(lines.join('\n'), 'ok');
+  }
+
+  /** 与服务端同步：分片异步（每批一个 setTimeout tick），单批失败跳过且绝不中断整体。 */
+  function dbSyncStart() {
+    if (S.db.busy) return;
+    if (DEMO || !N) { dbInfo('演示模式（浏览器预览）不支持数据库同步', 'err'); return; }
+    saveDbBase();
+    S.db.busy = true;
+    S.db.warns = [];
+    S.db.failedBatches = 0;
+    setDbButtons(true);
+
+    // 先配地址（不开对照），服务端整体不可达时快速失败并给可操作提示
+    var e0 = dbApplyBase(S.db.base, false);
+    if (e0) {
+      dbSyncEnd('地址无效或无法保存：' + e0 + '\n' + DB_HINT, true);
+      return;
+    }
+    var local = dbLocal();
+    if (local.__err) dbWarn('本地库状态读取失败：' + local.__err + '（各组合按首次同步 since=0 处理）');
+    var srv = dbGet('/api/db/status');
+    if (srv.__err) {
+      dbSyncEnd('服务端数据库不可达：' + srv.__err + '\n' + DB_HINT, true);
+      return;
+    }
+
+    var localPeriods = local.periods || {};
+    var combos = [];
+    DB_CODES.forEach(function (code) {
+      DB_DOWN_PERIODS.forEach(function (p) {
+        var v = localPeriods[code + '|' + p];
+        var mx = v && v.max !== undefined ? Number(v.max) : 0;
+        if (!isFinite(mx) || mx < 0) mx = 0;
+        combos.push({ dir: 'down', code: code, period: p, since: mx, page: 0 });
+      });
+    });
+    DB_CODES.forEach(function (code) {
+      DB_UP_PERIODS.forEach(function (p) {
+        combos.push({ dir: 'up', code: code, period: p, since: 0, page: 0 });
+      });
+    });
+    var M = combos.length;
+    var ci = 0, done = 0;
+    var stat = { down: 0, up: 0, net: 0 };
+
+    dbInfo('已连接服务端，开始双向增量同步（共 ' + M + ' 个组合）…', '');
+    progSet('#dbProgWrap', 0, '准备同步…', 'indet');
+
+    function label(c) {
+      return '第 ' + (done + 1) + '/' + M + ' 批 · ' + (c.dir === 'down' ? '下拉' : '上推')
+        + ' · ' + c.code + ' ' + c.period + (c.page > 0 ? ' · 第 ' + (c.page + 1) + ' 页' : '');
+    }
+    function nextCombo() { ci++; done++; }
+    function advance() { setTimeout(step, 0); }
+
+    function step() {
+      if (ci >= M) { dbSyncEnd(null, false, stat); return; }
+      var c = combos[ci];
+      var lb = label(c);
+      progSet('#dbProgWrap',
+        Math.round((done + Math.min(0.9, c.page / DB_MAX_BATCH)) / M * 100), lb, '');
+      dbInfo(lb, '');
+
+      if (c.dir === 'down') {
+        var path = '/api/db/export?code=' + encodeURIComponent(c.code)
+          + '&period=' + encodeURIComponent(c.period)
+          + '&since=' + encodeURIComponent(c.since) + '&limit=' + DB_LIMIT;
+        var r = dbGet(path);
+        if (r.__err) { dbWarn(lb + ' 失败：' + r.__err); nextCombo(); advance(); return; }
+        var bars = r.bars || [];
+        if (bars.length) {
+          var added = dbImport(c.code, c.period, bars);
+          if (added === -1) { dbWarn(lb + ' importBars 返回失败'); nextCombo(); advance(); return; }
+          stat.down += bars.length;
+          if (added > 0) stat.net += added;
+        }
+        c.page++;
+        var ns = Number(r.next_since);
+        var more = !!r.has_more && c.page < DB_MAX_BATCH && isFinite(ns) && ns > c.since;
+        if (more) c.since = ns;
+        else {
+          if (r.has_more && c.page >= DB_MAX_BATCH) dbWarn(lb + ' 达到单组合 30 批上限，剩余留待下次');
+          else if (r.has_more) dbWarn(lb + ' 分页游标未前进，提前结束该组合');
+          nextCombo();
+        }
+        advance();
+        return;
+      }
+
+      // 上推：本地 exportBars 翻页 → serverPost /api/db/import
+      var ex = dbExport(c.code, c.period, c.since, DB_LIMIT);
+      if (ex.__err) { dbWarn(lb + ' 失败：' + ex.__err); nextCombo(); advance(); return; }
+      var upBars = ex.bars || [];
+      if (upBars.length) {
+        var body;
+        try {
+          body = JSON.stringify({ code: c.code, period: c.period, bars: upBars, source: 'app' });
+        } catch (e) { body = null; }
+        if (!body) { dbWarn(lb + ' 上推数据序列化失败'); nextCombo(); advance(); return; }
+        var pr = dbPost('/api/db/import', body);
+        if (pr.__err || pr.ok === false) {
+          dbWarn(lb + ' 上推失败：' + (pr.__err || pr.note || '服务端未确认'));
+          nextCombo(); advance(); return;
+        }
+        stat.up += upBars.length;
+        var a = Number(pr.added);
+        if (isFinite(a) && a > 0) stat.net += a;
+      }
+      c.page++;
+      var ns2 = Number(ex.next_since);
+      var more2 = (!!ex.has_more || upBars.length >= DB_LIMIT)
+        && c.page < DB_MAX_BATCH && isFinite(ns2) && ns2 > c.since;
+      if (more2) c.since = ns2;
+      else {
+        if ((ex.has_more || upBars.length >= DB_LIMIT) && c.page >= DB_MAX_BATCH)
+          dbWarn(lb + ' 达到单组合 30 批上限，剩余留待下次');
+        nextCombo();
+      }
+      advance();
+    }
+
+    setTimeout(step, 0);
+  }
+
+  function dbWarn(msg) {
+    S.db.warns.push(msg);
+    if (typeof console !== 'undefined' && console.warn) console.warn('[dbSync] ' + msg);
+  }
+
+  /** 统一收尾：还原 Native 配置、解除锁定、写进度条 / 状态行、渲染诊断、刷新行情。 */
+  function dbSyncEnd(errMsg, isErr, stat) {
+    dbRestoreServer();
+    S.db.busy = false;
+    S.db.failedBatches = isErr ? 0 : S.db.warns.length;
+    setDbButtons(false);
+    if (isErr) {
+      progSet('#dbProgWrap', 0, errMsg || '同步失败', 'fail');
+      dbInfo(errMsg || '同步失败', 'err');
+    } else {
+      stat = stat || { down: 0, up: 0, net: 0 };
+      var msg = '同步完成 · 下拉 ' + stat.down + ' 根 · 上推 ' + stat.up + ' 根'
+        + ' · 净新增 ' + stat.net + ' 根'
+        + (S.db.warns.length ? ' · 跳过 ' + S.db.warns.length + ' 批（失败已忽略）' : '');
+      progSet('#dbProgWrap', 100, msg, 'done');
+      var tail = S.db.warns.length
+        ? '\n' + S.db.warns.slice(-4).join('\n')
+          + (S.db.warns.length > 4 ? '\n…还有 ' + (S.db.warns.length - 4) + ' 条' : '')
+        : '';
+      dbInfo(msg + tail, S.db.warns.length ? '' : 'ok');
+    }
+    renderDbDiag();
+    pull(true);
+  }
+
+  /** 诊断区：本地库每周期 n / 首末时间 / legacy 残留 / 上次同步 / 失败批。 */
+  function renderDbDiag() {
+    var box = $('#dbDiag');
+    if (!box) return;
+    if (DEMO) {
+      box.innerHTML = '<div class="db-diag-title">本地库诊断</div>'
+        + '<div class="db-diag">演示模式（浏览器预览）无本地 SQLite 库。</div>' + diagHint();
+      return;
+    }
+    var st = dbLocal();
+    if (st.__err) {
+      box.innerHTML = '<div class="db-diag-title">本地库诊断</div>'
+        + '<div class="db-diag">读取失败：' + esc(st.__err) + '</div>' + diagHint();
+      return;
+    }
+    var lines = [];
+    var periods = st.periods || {};
+    var keys = Object.keys(periods).sort();
+    if (keys.length) {
+      keys.forEach(function (k) {
+        var v = periods[k] || {};
+        var n = v.n === undefined ? '—' : v.n;
+        var t0 = v.min ? dateStr(Number(v.min)) : '—';
+        var t1 = v.max ? dateStr(Number(v.max)) : '—';
+        var lg = v.legacy === undefined ? '—' : v.legacy;
+        lines.push('<b>' + esc(k) + '</b>  ' + esc(n) + ' 根 · 首 ' + esc(t0)
+          + ' · 末 ' + esc(t1) + ' · legacy 残留 ' + esc(lg));
+      });
+    } else {
+      lines.push('（本地库暂无周期统计）');
+    }
+    if (st.ticks) {
+      var tk = st.ticks;
+      lines.push('<b>ticks</b>  ' + (tk.n === undefined ? '—' : esc(tk.n)) + ' 点'
+        + (tk.min ? ' · 首 ' + esc(dateStr(Number(tk.min))) : '')
+        + (tk.max ? ' · 末 ' + esc(dateStr(Number(tk.max))) : ''));
+    }
+    lines.push('—');
+    lines.push('上次同步：' + (st.last_sync ? esc(timeStr(Number(st.last_sync))) : '—'));
+    lines.push('待同步 pending：' + (st.pending === undefined ? '—' : esc(st.pending)));
+    lines.push('seed_version：' + (st.seed_version === undefined ? '—' : esc(st.seed_version))
+      + ' · migrated：' + (st.migrated ? '是' : '否'));
+    lines.push('失败批：' + (S.db.failedBatches || 0));
+    if (st.note) lines.push('note：' + esc(String(st.note)));
+    if (S.db.warns && S.db.warns.length) {
+      lines.push('—');
+      lines.push('<span class="dg-warn">最近失败明细（已跳过，不影响本地）：</span>');
+      S.db.warns.slice(-5).forEach(function (w) { lines.push('· ' + esc(w)); });
+    }
+    box.innerHTML = '<div class="db-diag-title">本地库诊断</div>'
+      + '<div class="db-diag">' + lines.join('<br>') + '</div>'
+      + diagHint();
+  }
+
+  function diagHint() {
+    return '<div class="hint">「新增 0 根」属正常：本地已与源站能提供的历史窗口一致，'
+      + '更早的历史需由服务端补齐后，再通过本页「与服务端同步」下拉获得。</div>';
+  }
+
+  /** 重建本地数据库：二次确认 → Native 后台执行 → 全局 onDbRebuild 回调驱动进度。 */
+  function dbRebuildStart() {
+    if (S.db.busy) return;
+    if (DEMO || !N || typeof N.rebuildLocalDb !== 'function') {
+      dbInfo('当前环境不支持重建本地数据库', 'err');
+      return;
+    }
+    if (!confirm('重建本地数据库会清空本地 K 线，并从预置库重新导入（ticks / 预测记录会保留）。\n'
+      + '此操作不可撤销，确定继续吗？')) return;
+    S.db.busy = true;
+    S.db.warns = [];
+    setDbButtons(true);
+    dbInfo('正在后台重建本地数据库…', '');
+    progSet('#dbProgWrap', 0, '重建本地数据库…', 'indet');
+    try { N.rebuildLocalDb(); } catch (e) {
+      onDbRebuild({ phase: 'error', msg: dbHint(e) });
+    }
+  }
+
+  /** Native 重建回调（全局）：start / step / done / error 四相。 */
+  function onDbRebuild(o) {
+    if (typeof o === 'string') o = { phase: 'step', msg: o };
+    o = o || {};
+    var phase = o.phase || 'step';
+    var msg = o.msg || '';
+    var pct = Number(o.pct);
+    if (!isFinite(pct)) pct = 0;
+    var rows = o.rows;
+    if (phase === 'done') {
+      progSet('#dbProgWrap', 100,
+        '重建完成 · 共 ' + (rows === undefined ? '—' : rows) + ' 根', 'done');
+      dbInfo('重建完成 · 共 ' + (rows === undefined ? '—' : rows)
+        + ' 根（ticks / 预测记录已保留）', 'ok');
+      S.db.busy = false;
+      setDbButtons(false);
+      pull(true);
+      renderDbDiag();
+      return;
+    }
+    if (phase === 'error') {
+      progSet('#dbProgWrap', pct, '重建失败：' + msg, 'fail');
+      dbInfo('重建失败：' + msg, 'err');
+      S.db.busy = false;
+      setDbButtons(false);
+      renderDbDiag();
+      pull(true);
+      return;
+    }
+    progSet('#dbProgWrap', pct,
+      (phase === 'start' ? '开始重建 · ' : '重建中 · ') + msg
+      + (rows === undefined ? '' : '（' + rows + ' 根）'),
+      pct > 0 ? '' : 'indet');
+    dbInfo('重建中 · ' + msg, '');
+  }
+
+  // Native 可能通过 window.onDbRebuild 或 FF.onDbRebuild 回调，两个入口都指向同一处理函数
+  window.onDbRebuild = onDbRebuild;
+
+  function initDb() {
+    var el = $('#dbServerBase');
+    if (el) el.value = S.db.base;
+  }
+
   // ---------------- 设置 ----------------
 
   function loadSettings() {
@@ -1430,7 +1863,7 @@
     if (btn) { btn.disabled = true; btn.textContent = '立即更新'; }
     progSet('#updProgWrap', 0, '正在读取 Gitee 发行版信息…', 'indet');
     if (DEMO) {
-      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.5.0（演示）' });
+      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.6.0（演示）' });
       return;
     }
     try { N.checkUpdate(); } catch (e) {
@@ -1844,6 +2277,16 @@
       S.server.base = sBase.value.trim() || S.server.base;
       saveServerPrefs();
     });
+
+    // 数据库同步（手机 ↔ 服务端）：同步 / 测试 / 重建 / 地址持久化
+    var dbSyncBtn = $('#btnDbSync');
+    if (dbSyncBtn) dbSyncBtn.addEventListener('click', dbSyncStart);
+    var dbTestBtn = $('#btnDbTest');
+    if (dbTestBtn) dbTestBtn.addEventListener('click', dbTest);
+    var dbRebuildBtn = $('#btnDbRebuild');
+    if (dbRebuildBtn) dbRebuildBtn.addEventListener('click', dbRebuildStart);
+    var dbBaseEl = $('#dbServerBase');
+    if (dbBaseEl) dbBaseEl.addEventListener('change', saveDbBase);
   }
 
   // ---------------- Native 回调 ----------------
@@ -1857,7 +2300,8 @@
     onSyncStep: function (msg) { onSyncStep(msg); },
     onPredictStep: function (o) { onPredictStep(o); },
     onPredict: function (res) { onPredict(res); },
-    onToast: function (msg) { toast(msg); }
+    onToast: function (msg) { toast(msg); },
+    onDbRebuild: function (o) { onDbRebuild(o); }
   };
 
   // ---------------- 演示数据（浏览器预览用） ----------------
@@ -1973,8 +2417,10 @@
 
   bind();
   initServer();   // 先恢复服务端开关，再让首次 pull 用正确的模式取数
+  initDb();       // 恢复数据库同步地址输入框
   pull(true);
   loadSettings();
+  renderDbDiag(); // 启动时渲染本地库诊断区
   setInterval(function () {
     if (S.tab === 'market' || S.tab === 'forecast') pull();
   }, 5000);

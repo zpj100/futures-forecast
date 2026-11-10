@@ -80,6 +80,21 @@ def _init_schema(c: sqlite3.Connection) -> None:
             codes   TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_news_ts ON news(ts DESC);
+
+        -- 手机上传的「源站段末口径」多周期分表（双向同步专用）。
+        -- 只由 /api/db/import 写入；5m/15m/30m/60m 的 /api/db/export 只读本表，
+        -- 与 kline_multi（服务端自然桶聚合口径）物理隔离，绝不混入既有接口。
+        -- ts 统一 UTC 毫秒整数；主键 (code,period,ts) 保证幂等。
+        CREATE TABLE IF NOT EXISTS kline_app (
+            code   TEXT NOT NULL,
+            period TEXT NOT NULL,
+            ts     INTEGER NOT NULL,   -- epoch milliseconds
+            o REAL, h REAL, l REAL, c REAL, v REAL,
+            source TEXT,
+            PRIMARY KEY (code, period, ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_kapp_code_period_ts
+            ON kline_app(code, period, ts);
         """
     )
     c.commit()
@@ -473,3 +488,102 @@ def snapshot_ohlc(code: str, limit: int = 4500) -> list[dict]:
             "v": s.get("volume") or 0.0,
         })
     return out
+
+
+# ------------------------------------------------------------- kline_app
+# 双向同步专用分表：手机上传的「源站段末口径」5/15/30/60m 序列。
+# 与 kline_multi（服务端自然桶聚合口径）物理隔离，避免污染既有 /api/kline
+# 与 /api/app/* 的输出；ts 一律 UTC 毫秒整数。
+
+def get_app(code: str, period: str, limit: int = 100000) -> list[dict]:
+    """按 ts 升序读取 kline_app 的 (code,period) 序列，ts 为毫秒整数。"""
+    with _lock:
+        c = _connect()
+        rows = c.execute(
+            "SELECT ts,o,h,l,c,v FROM kline_app WHERE code=? AND period=?"
+            " ORDER BY ts ASC LIMIT ?",
+            (code, period, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_app(code: str, period: str, bars: list[dict],
+               source: str = "app") -> tuple[int, int]:
+    """幂等写入 kline_app，返回 (净新增行数, 该组合写入后总行数)。
+
+    bars 需已由调用方校验/去重，ts 为毫秒整数、OHLC 为有限浮点。
+    先按主键查已存在 ts 计数，再用 INSERT OR REPLACE 覆盖重复项；
+    added = 去重后根数 - 已存在数，重复调用恒为 0。
+    """
+    ts_list = [int(b["ts"]) for b in bars]
+    with _lock:
+        c = _connect()
+        if not ts_list:
+            total = int(c.execute(
+                "SELECT COUNT(*) FROM kline_app WHERE code=? AND period=?",
+                (code, period)).fetchone()[0])
+            return 0, total
+        marks = ",".join("?" for _ in ts_list)
+        existing = int(c.execute(
+            "SELECT COUNT(*) FROM kline_app WHERE code=? AND period=?"
+            f" AND ts IN ({marks})",
+            (code, period, *ts_list)).fetchone()[0])
+        rows = [
+            (code, period, int(b["ts"]), b["o"], b["h"], b["l"], b["c"],
+             b["v"], source)
+            for b in bars
+        ]
+        c.executemany(
+            "INSERT OR REPLACE INTO kline_app(code,period,ts,o,h,l,c,v,source)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        c.commit()
+        total = int(c.execute(
+            "SELECT COUNT(*) FROM kline_app WHERE code=? AND period=?",
+            (code, period)).fetchone()[0])
+    return len(rows) - existing, total
+
+
+def db_status() -> dict:
+    """组装 /api/db/status 数据主体：periods / app_table / snapshots。
+
+    periods 覆盖三品种×六周期(1m/5m/15m/30m/60m/1d)，值来自既有表，
+    字符串/秒 ts 统一经 bar_ts_ms 转毫秒整数；app_table 覆盖 kline_app
+    各 (code,period) 计数并补齐三品种×四周期默认 0；snapshots 为全表行数。
+    """
+    multi_periods = tuple(p for p, _ in MULTI_PERIODS)
+    periods: dict[str, dict] = {}
+    with _lock:
+        c = _connect()
+        for code in PRODUCT_BY_CODE:
+            for period, table in (("1m", "kline_min"), ("1d", "kline_day")):
+                r = c.execute(
+                    f"SELECT COUNT(*), MIN(ts), MAX(ts) FROM {table}"
+                    " WHERE code=?", (code,)).fetchone()
+                n = int(r[0]) if r and r[0] is not None else 0
+                lo = (bar_ts_ms(r[1]) or 0) if n else 0
+                hi = (bar_ts_ms(r[2]) or 0) if n else 0
+                periods[f"{code}|{period}"] = {"n": n, "min": lo, "max": hi}
+            for period in multi_periods:
+                r = c.execute(
+                    "SELECT COUNT(*), MIN(ts), MAX(ts) FROM kline_multi"
+                    " WHERE code=? AND period=?", (code, period)).fetchone()
+                n = int(r[0]) if r and r[0] is not None else 0
+                lo = int(r[1]) if n and r[1] is not None else 0
+                hi = int(r[2]) if n and r[2] is not None else 0
+                periods[f"{code}|{period}"] = {"n": n, "min": lo, "max": hi}
+
+        app_table: dict[str, dict] = {
+            f"{code}|{period}": {"n": 0}
+            for code in PRODUCT_BY_CODE for period in multi_periods
+        }
+        for r in c.execute(
+                "SELECT code, period, COUNT(*) FROM kline_app"
+                " GROUP BY code, period").fetchall():
+            app_table[f"{r[0]}|{r[1]}"] = {"n": int(r[2])}
+
+        snaps = int(c.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0])
+    return {"periods": periods,
+            "app_table": app_table,
+            "snapshots": {"n": snaps}}

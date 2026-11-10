@@ -174,6 +174,36 @@
       </div>
 
       <div class="panel">
+        <div class="panel-title">数据库同步（手机 ↔ 服务端）</div>
+        <div class="field-label">服务端地址（电脑局域网 / WSL 后端）</div>
+        <input id="dbServerBase" class="input" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000" autocapitalize="off" spellcheck="false" autocomplete="off">
+        <div class="row-btns">
+          <button class="btn" id="btnDbSync">与服务端同步</button>
+          <button class="btn ghost" id="btnDbTest">测试连接</button>
+        </div>
+        <div class="row-btns">
+          <button class="btn ghost danger" id="btnDbRebuild">重建本地数据库</button>
+        </div>
+        <div class="prog-wrap" id="dbProgWrap" hidden>
+          <div class="prog"><i id="dbProgBar"></i></div>
+          <div class="prog-meta">
+            <span id="dbProgText">准备同步…</span>
+            <span id="dbProgPct">0%</span>
+          </div>
+        </div>
+        <div class="server-state" id="dbInfo">尚未同步</div>
+        <div class="hint">
+          手机需填 <b>http://&lt;电脑局域网IP&gt;:8000</b>（127.0.0.1 只指向手机自己，连不到电脑）；
+          WSL 服务端须以 <b>0.0.0.0</b> 启动并配置 <b>Windows 端口转发</b>（netsh interface portproxy），
+          手机与电脑需在同一局域网。地址保存在本机；「测试连接」只配置地址，<b>不会开启服务端对照</b>。
+          同步是<b>双向增量</b>：下拉把服务端历史补到本地、上推把本地周期线回传服务端，
+          单批失败自动跳过，<b>不影响本地离线使用</b>。
+          「重建本地数据库」会清空本地 K 线并从预置库重新导入（ticks / 预测记录保留），需二次确认。
+        </div>
+        <div id="dbDiag"></div>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">本地数据</div>
         <div class="stat-row tight two" id="dataStats"></div>
         <div class="row-btns">
