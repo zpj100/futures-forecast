@@ -260,10 +260,14 @@ def _ridge_forecast(close: np.ndarray, high: np.ndarray, low: np.ndarray,
 # --------------------------------------------------------------------- main
 
 def forecast_one(code: str, name: str, minute_bars: list[dict],
-                 daily_bars: list[dict], horizons=None) -> dict:
+                 daily_bars: list[dict], horizons=None,
+                 native: dict | None = None) -> dict:
     """多档预测。horizons 缺省为 HORIZON_DEFS（既有 /api/forecast 的六档，输出不变）；
     传入 APP_HORIZONS 时按七档计算（/api/app/forecast 用，30m/4h 由聚合序列补算）。
-    建模逻辑与 _empty 的「数据不足 / p_up=0.5」保持一致，不伪造精度。
+    native 为 {step(int): [bars]} 的内盘原生多周期序列（ms ts）：当某分钟档的
+    step 命中且有足够样本时，直接以原生序列建模（根治 1m 聚合样本不足），否则
+    回退既有「1m 时间桶聚合」。建模逻辑与 _empty 的「数据不足 / p_up=0.5」一致，
+    不伪造精度（外盘无原生历史、4h 无原生周期时仍如实标数据不足）。
     """
     horizon_defs = horizons or HORIZON_DEFS
     out: list[dict] = []
@@ -277,10 +281,16 @@ def forecast_one(code: str, name: str, minute_bars: list[dict],
         float(d_close[-1]) if len(d_close) else 0.0)
 
     for key, label, minutes, series, step in horizon_defs:
-        # 前四档按真实周期把 1m 序列做时间桶聚合后再计算特征与标签；
-        # 8h/1d 仍直接用日线序列。step 语义（桶宽 / 前向回看根数）保持不变。
-        base = (_aggregate_minute_bars(minute_bars, step)
-                if series == "minute" else daily_bars)
+        # 分钟档优先用内盘原生多周期（直采、样本充足、根治聚合不足）；
+        # 命中原生且样本达标则用原生序列直接建模，否则回退 1m 时间桶聚合。
+        # 8h/1d 仍直接用日线序列。step 语义（前向回看根数）保持不变。
+        if series == "minute" and native and step in native \
+                and len(native[step]) >= _MIN_SAMPLES + step + 10:
+            base = native[step]
+        elif series == "minute":
+            base = _aggregate_minute_bars(minute_bars, step)
+        else:
+            base = daily_bars
         if len(base) < _MIN_SAMPLES + step + 10:
             out.append(_empty(key, label, minutes, price,
                               f"样本不足（{len(base)} 根）"))

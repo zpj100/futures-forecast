@@ -30,11 +30,11 @@ _APP_PERIODS = tuple(p for p, _ in MULTI_PERIODS)      # 5m/15m/30m/60m
 _ALL = 1_000_000
 
 _NOTE_STATUS = (
-    "ts 统一 UTC 毫秒整数；5m/15m/30m/60m 的导出来自手机上传的 kline_app "
-    "分表（源站段末口径），服务端自身 kline_multi 是自然桶聚合口径，"
-    "不导出给手机以免污染"
+    "ts 统一 UTC 毫秒整数；5m/15m/30m/60m 的导出优先取自服务端权威原生"
+    "多周期 kline_native（内盘直采，不经 1m 聚合），无则回退聚合"
+    "kline_multi，再无则手机上传 kline_app；手机同步补缺以本序列为准"
 )
-_NOTE_EMPTY_APP = "该周期服务端暂无手机上传的源站口径数据"
+_NOTE_EMPTY_MULTI = "该周期服务端暂无权威原生/聚合数据，亦无手机上传的源站口径数据"
 _NOTE_IMPORT = (
     "写入独立分表 kline_app（源站段末口径），不触碰 kline_min/kline_day/"
     "kline_multi，既有接口零影响；主键 (code,period,ts) 幂等，重复上传净新增为 0"
@@ -94,8 +94,8 @@ def _source_note(period):
         return "1m 来自 kline_min，字符串 ts 已统一转 UTC 毫秒整数"
     if period == "1d":
         return "1d 来自 kline_day，字符串 ts 已统一转 UTC 毫秒整数"
-    return (f"{period} 来自手机上传的 kline_app 分表（源站段末口径），"
-            "ts 为毫秒整数；服务端 kline_multi 自然桶聚合口径不导出")
+    return (f"{period} 优先取自服务端权威原生多周期 kline_native（内盘直采，"
+            "不经 1m 聚合）；无则回退聚合 kline_multi；再无则手机上传 kline_app")
 
 
 def _export_rows(code, period):
@@ -113,8 +113,14 @@ def _export_rows(code, period):
     elif period == "1d":
         raw = store.get_daily(code, _ALL)               # ts 字符串
         rows = [_norm_bar(store.bar_ts_ms(b.get("ts")), b) for b in raw]
-    else:  # 5m/15m/30m/60m：只读 kline_app
-        raw = store.get_app(code, period, _ALL)         # ts 毫秒整数
+    else:  # 5m/15m/30m/60m：优先服务端权威原生多周期（内盘直采），
+           # 回退聚合 kline_multi（外盘/历史），再回退手机上传 kline_app。
+           # 手机同步补缺时以此 authoritative 序列为准，避免把缺口反向污染到手机。
+        raw = store.get_native(code, period, _ALL)       # 内盘原生：最权威
+        if not raw:
+            raw = store.get_multi(code, period, _ALL)     # 外盘/聚合回退
+        if not raw:
+            raw = store.get_app(code, period, _ALL)       # 手机上传回退
         rows = [_norm_bar(b.get("ts"), b) for b in raw]
     return [r for r in rows if r is not None]
 
@@ -159,7 +165,7 @@ async def db_export(code: str = Query("AL"),
         rows = _export_rows(code, period)
         bars, next_since, has_more = _paginate(rows, since, limit)
         if period in _APP_PERIODS and not rows:
-            note = _NOTE_EMPTY_APP
+            note = _NOTE_EMPTY_MULTI
         else:
             note = _source_note(period)
         return {
@@ -172,6 +178,35 @@ async def db_export(code: str = Query("AL"),
         }
     except Exception as e:  # noqa: BLE001
         log.exception("db/export 失败")
+        return JSONResponse({"error": type(e).__name__}, status_code=500)
+
+
+@router.get("/api/db/sync3d")
+async def db_sync3d(code: str = Query("AL"),
+                    period: str = Query("1m")):
+    """返回服务端权威的「最近 3 天」完整切片（非分页），供手机/前端补缺。
+
+    手机同步时按 (code,period) 调用本接口，把返回的全部 bar 以 INSERT OR REPLACE
+    幂等写入本地 SQLite，即完成「对比最近 3 天、缺少的插入」：服务端为权威源，
+    最近 3 天内以服务端为准，覆盖/补齐手机本地缺口。
+    数据来源与 /api/db/export 一致（原生 kline_native → 聚合 kline_multi →
+    手机上传 kline_app）。所有 ts 为毫秒整数。
+    """
+    if not _valid_code(code) or not _valid_period(period):
+        return JSONResponse({"error": "invalid code or period"}, status_code=400)
+    window = int(time.time() * 1000) - 3 * 86400_000
+    try:
+        rows = [r for r in _export_rows(code, period) if r["ts"] >= window]
+        return {
+            "code": code,
+            "period": period,
+            "window_start": window,
+            "bars": rows,
+            "count": len(rows),
+            "note": _source_note(period),
+        }
+    except Exception as e:  # noqa: BLE001
+        log.exception("db/sync3d 失败")
         return JSONResponse({"error": type(e).__name__}, status_code=500)
 
 

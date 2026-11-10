@@ -70,6 +70,20 @@ def _init_schema(c: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_kmulti_code_period_ts
             ON kline_multi(code, period, ts);
 
+        -- 服务端权威「原生多周期」：直接取自 Sina 原生 5/15/30/60m 接口（内盘），
+        -- 不经 1m 聚合，根治「聚合样本不足」导致的预测数据不足。
+        -- ts 为毫秒整数（与 kline_multi 同口径），主键 (code,period,ts) 幂等。
+        -- 外盘(LME)原生分钟接口仅返回当前交易时段，无法回溯，故只存内盘。
+        CREATE TABLE IF NOT EXISTS kline_native (
+            code   TEXT NOT NULL,
+            period TEXT NOT NULL,
+            ts     INTEGER NOT NULL,   -- epoch milliseconds
+            o REAL, h REAL, l REAL, c REAL, v REAL,
+            PRIMARY KEY (code, period, ts)
+        );
+        CREATE INDEX IF NOT EXISTS idx_knative_code_period_ts
+            ON kline_native(code, period, ts);
+
         CREATE TABLE IF NOT EXISTS news (
             id      TEXT PRIMARY KEY,
             source  TEXT,
@@ -456,6 +470,73 @@ def sync_multi_incremental(code: str, minute_bars: list[dict]) -> int:
         if fresh:
             written += upsert_multi(code, period, fresh)
     return written
+
+
+# ------------------------------------------------------------- kline_native
+# 服务端权威原生多周期（内盘 5/15/30/60m 直接取自 Sina 原生接口，不经 1m 聚合）。
+# ts 一律毫秒整数；bars 由调用方（collector）完成 ts 归一化与 c 校验。
+
+def upsert_native(code: str, period: str, bars: Iterable[dict]) -> int:
+    """幂等写入 kline_native，返回真实新增行数（供 collector 增量统计）。"""
+    rows = [
+        (code, period, int(b["ts"]), b.get("o"), b.get("h"), b.get("l"),
+         b.get("c"), b.get("v"))
+        for b in bars
+        if b.get("ts") is not None and b.get("c") is not None
+    ]
+    if not rows:
+        return 0
+    with _lock:
+        c = _connect()
+        before = c.total_changes
+        c.executemany(
+            "INSERT OR REPLACE INTO kline_native(code,period,ts,o,h,l,c,v)"
+            " VALUES(?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        c.commit()
+        added = c.total_changes - before
+    return added
+
+
+def get_native(code: str, period: str, limit: int = 20000) -> list[dict]:
+    """按 ts 升序读取 kline_native 的 (code,period) 序列，ts 为毫秒整数。"""
+    with _lock:
+        c = _connect()
+        rows = c.execute(
+            "SELECT ts,o,h,l,c,v FROM kline_native WHERE code=? AND period=?"
+            " ORDER BY ts DESC LIMIT ?",
+            (code, period, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in reversed(rows)]
+
+
+def native_latest_ts(code: str, period: str) -> int:
+    """该 (code,period) 最新 bar 毫秒 ts；空表返回 0。"""
+    with _lock:
+        c = _connect()
+        r = c.execute(
+            "SELECT MAX(ts) FROM kline_native WHERE code=? AND period=?",
+            (code, period)).fetchone()
+    return int(r[0]) if r and r[0] is not None else 0
+
+
+def native_first_ts(code: str, period: str) -> int:
+    """该 (code,period) 真实覆盖起点毫秒；空表返回 0。"""
+    with _lock:
+        c = _connect()
+        r = c.execute(
+            "SELECT MIN(ts) FROM kline_native WHERE code=? AND period=?",
+            (code, period)).fetchone()
+    return int(r[0]) if r and r[0] is not None else 0
+
+
+def native_count(code: str, period: str) -> int:
+    with _lock:
+        c = _connect()
+        return int(c.execute(
+            "SELECT COUNT(*) FROM kline_native WHERE code=? AND period=?",
+            (code, period)).fetchone()[0])
 
 
 # ------------------------------------------------------------- 统计 / 秒级

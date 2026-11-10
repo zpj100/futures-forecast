@@ -31,6 +31,7 @@ class State:
         self.last_news_ts: float = 0.0
         self.last_forecast_ts: float = 0.0
         self.errors: list[str] = []
+        self.native: dict[str, dict] = {}   # code -> {step: [native bars ms-ts]}
 
     def snapshot_meta(self) -> dict:
         return {
@@ -65,6 +66,31 @@ def _err(summary: str) -> None:
     clean = _URL_RE.sub("<url>", " ".join(str(summary).split()))
     state.errors.append(f"{datetime.now(timezone.utc):%H:%M:%S} {clean[:120]}")
     state.errors = state.errors[-20:]
+
+
+async def _fetch_native(code: str) -> dict[int, list[dict]]:
+    """抓取内盘原生 5/15/30/60m 序列（Sina 直采），归一化为 ms ts，返回 {step: bars}。
+
+    外盘(LME)原生分钟接口仅返回当前交易时段、无法回溯，不具备多周期历史价值，
+    故只对内盘调用；外盘预测仍走既有「1m 聚合」路径（样本不足时如实标数据不足）。
+    """
+    out: dict[int, list[dict]] = {}
+    for step in (5, 15, 30, 60):
+        try:
+            bars = await sina.fetch_minute(code, step)
+        except Exception as e:  # noqa: BLE001
+            _report(f"native {code} {step}m", e)
+            continue
+        norm = []
+        for b in bars:
+            ts = store.bar_ts_ms(b.get("t") or b.get("ts"))
+            if ts is None or b.get("c") is None:
+                continue
+            norm.append({"ts": ts, "o": b.get("o"), "h": b.get("h"),
+                         "l": b.get("l"), "c": b.get("c"), "v": b.get("v")})
+        if norm:
+            out[step] = norm
+    return out
 
 
 def _report(context: str, exc: BaseException) -> None:
@@ -127,13 +153,23 @@ async def tick_klines() -> None:
                 mm, dd = state.minute[code], state.daily[code]
                 if not mm and not dd and state.forecast.get(code):
                     continue      # 保留上次成功预测
+                # 内盘原生多周期直采（根治预测样本不足）：不经 1m 聚合，
+                # 直接以 Sina 原生 5/15/30/60m 序列喂给预测（外盘仅当前时段，跳过）。
+                native = {}
+                if p["market"] == "inner":
+                    native = await _fetch_native(code)
+                    for step, bars in native.items():
+                        store.upsert_native(code, f"{step}m", bars)
+                state.native[code] = native
                 # 多周期增量落库：把本地累计 1m 按自然时间桶聚合成 5/15/30/60m，
-                # 只写尾部新桶/更新进行中桶，不每轮全量重写（1m 不插值、不伪造）。
+                # 只写尾部新桶/更新进行中桶，不每轮全量重写（1m 不插值、不伪造）；
+                # 外盘/无原生周期仍依赖此聚合，内盘预测优先用原生（见 forecast_one）。
                 if mm:
                     store.sync_multi_incremental(code, mm)
                 # CPU 密集建模放线程，避免阻塞事件循环导致 WS/API 停摆
                 state.forecast[code] = await asyncio.to_thread(
-                    forecast_one, code, p["name"], mm, dd, APP_HORIZONS)
+                    forecast_one, code, p["name"], mm, dd, APP_HORIZONS,
+                    native=state.native.get(code))
                 # 预测历史落库（七档），供命中率统计；并定期清理 90 天前日志
                 _log_forecast(code, state.forecast[code])
                 store.truncate_forecast_log(int(time.time() * 1000)
@@ -173,6 +209,15 @@ async def bootstrap() -> None:
         # 冷启动也把库里已有的 1m 历史增量聚合成多周期，避免新增表长期为空
         if state.minute[code]:
             store.sync_multi_incremental(code, state.minute[code])
+        # 冷启动直采内盘原生多周期，使首轮预测即可用原生序列（外盘跳过）
+        if PRODUCT_BY_CODE[code]["market"] == "inner":
+            try:
+                native = await _fetch_native(code)
+                for step, bars in native.items():
+                    store.upsert_native(code, f"{step}m", bars)
+                state.native[code] = native
+            except Exception as e:  # noqa: BLE001
+                _report(f"bootstrap native {code}", e)
     state.news = store.get_news(120)
 
 

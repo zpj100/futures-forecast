@@ -322,11 +322,22 @@
         out = aggregate((one && one.bars || []), period.step);
       }
     } catch (e) { out = []; }
-    // 把最新报价接到尾部：K 线只到上一根收盘，不接的话曲线总比现价慢一拍
+    // 把最后已知价平铺延伸到「现在」：分钟级以上曲线只到上一根收盘，
+    // 不延伸的话曲线右边缘总比现在慢一拍、留一段空白（与网页端 extendToNow 一致）。
+    // 1s/30s 是实时采集点，单点滞后由实时刷新覆盖，这里只在有更新鲜报价时补尾。
+    var lastTs = out.length ? out[out.length - 1][0] : 0;
+    var now = Date.now();
     var q = quoteOf(code);
-    if (q && q.last > 0 && out.length) {
-      var lastTs = out[out.length - 1][0];
-      var qTs = q.ts && q.ts > 0 ? q.ts : Date.now();
+    if (!isTick(period) && out.length >= 2) {
+      // 分钟级及以上（含日线）：末根距现在 >30s 才算滞后，平铺延伸
+      // （实时价优先，否则末收盘，保证曲线贴到右边缘）
+      if (now - lastTs > 30000) {
+        var ext = (q && q.last > 0) ? q.last : out[out.length - 1][4];
+        out.push([now, ext, ext, ext, ext, 0]);
+      }
+    } else if (out.length && q && q.last > 0) {
+      // 1s/30s：仅在报价比末根更新鲜时补一根实时尾点
+      var qTs = q.ts && q.ts > 0 ? q.ts : now;
       if (qTs > lastTs) out.push([qTs, q.last, q.last, q.last, q.last, 0]);
     }
     return out;
@@ -1339,27 +1350,58 @@
       dbInfo(lb, '');
 
       if (c.dir === 'down') {
-        var path = '/api/db/export?code=' + encodeURIComponent(c.code)
-          + '&period=' + encodeURIComponent(c.period)
-          + '&since=' + encodeURIComponent(c.since) + '&limit=' + DB_LIMIT;
-        var r = dbGet(path);
-        if (r.__err) { dbWarn(lb + ' 失败：' + r.__err); nextCombo(); advance(); return; }
-        var bars = r.bars || [];
-        if (bars.length) {
-          var added = dbImport(c.code, c.period, bars);
-          if (added === -1) { dbWarn(lb + ' importBars 返回失败'); nextCombo(); advance(); return; }
-          stat.down += bars.length;
-          if (added > 0) stat.net += added;
+        // 秒级（1s/30s）走既有 tail-only：手机本机采集为真源，只拉比本地新的尾部，
+        // 避免把服务端快照反向覆盖手机自己的实时采集点。
+        if (c.period === '1s' || c.period === '30s') {
+          var path = '/api/db/export?code=' + encodeURIComponent(c.code)
+            + '&period=' + encodeURIComponent(c.period)
+            + '&since=' + encodeURIComponent(c.since) + '&limit=' + DB_LIMIT;
+          var r = dbGet(path);
+          if (r.__err) { dbWarn(lb + ' 失败：' + r.__err); nextCombo(); advance(); return; }
+          var bars = r.bars || [];
+          if (bars.length) {
+            var added = dbImport(c.code, c.period, bars);
+            if (added === -1) { dbWarn(lb + ' importBars 返回失败'); nextCombo(); advance(); return; }
+            stat.down += bars.length;
+            if (added > 0) stat.net += added;
+          }
+          c.page++;
+          var ns = Number(r.next_since);
+          var more = !!r.has_more && c.page < DB_MAX_BATCH && isFinite(ns) && ns > c.since;
+          if (more) c.since = ns;
+          else {
+            if (r.has_more && c.page >= DB_MAX_BATCH) dbWarn(lb + ' 达到单组合 30 批上限，剩余留待下次');
+            else if (r.has_more) dbWarn(lb + ' 分页游标未前进，提前结束该组合');
+            nextCombo();
+          }
+          advance();
+          return;
         }
-        c.page++;
-        var ns = Number(r.next_since);
-        var more = !!r.has_more && c.page < DB_MAX_BATCH && isFinite(ns) && ns > c.since;
-        if (more) c.since = ns;
-        else {
-          if (r.has_more && c.page >= DB_MAX_BATCH) dbWarn(lb + ' 达到单组合 30 批上限，剩余留待下次');
-          else if (r.has_more) dbWarn(lb + ' 分页游标未前进，提前结束该组合');
-          nextCombo();
+
+        // 分钟级及以上（1m/5m/15m/30m/60m/1d）：走 /api/db/sync3d，
+        // 以服务端权威序列为准，一次性拉取「最近 3 天」完整切片幂等补缺，
+        // 覆盖/补齐手机本地中间缺失点（不再只拉尾部，根治中间数据点缺失）。
+        // importBars 单次上限 300 根，超量按 300 切片分批写入。
+        var p3 = '/api/db/sync3d?code=' + encodeURIComponent(c.code)
+          + '&period=' + encodeURIComponent(c.period);
+        var r3 = dbGet(p3);
+        if (r3.__err) { dbWarn(lb + ' 失败：' + r3.__err); nextCombo(); advance(); return; }
+        var bars3 = r3.bars || [];
+        if (bars3.length) {
+          var CH = 300, bi = 0, bnum = 0;
+          while (bi < bars3.length) {
+            var chunk = bars3.slice(bi, bi + CH);
+            var added3 = dbImport(c.code, c.period, chunk);
+            if (added3 === -1) {
+              dbWarn(lb + ' importBars 返回失败（第 ' + (bnum + 1) + ' 批）');
+              break;
+            }
+            stat.down += chunk.length;
+            if (added3 > 0) stat.net += added3;
+            bi += CH; bnum++;
+          }
         }
+        nextCombo();
         advance();
         return;
       }

@@ -81,7 +81,7 @@ async function loadProducts() {
   renderHistCodeSeg();
   renderDataMeta();
   $('#aboutVer').textContent = (d.horizons && d.horizons.length)
-    ? 'v2.7 · ' + d.horizons.length + ' 周期' : 'v2.7';
+    ? 'v2.8 · ' + d.horizons.length + ' 周期' : 'v2.8';
 }
 
 async function loadForecast() {
@@ -93,7 +93,8 @@ async function loadForecast() {
 
 async function loadKline(code, period) {
   const d = await getJSON(`/api/app/kline?code=${code}&period=${period}&limit=800`);
-  state.bars = d.bars || [];
+  const live = state.quotes[code] && state.quotes[code].last;
+  state.bars = extendToNow(d.bars || [], live);
   drawChart();
 }
 
@@ -101,10 +102,26 @@ async function loadCompare(period) {
   const series = [];
   await Promise.all(state.products.map(async (p) => {
     const d = await getJSON(`/api/app/kline?code=${p.code}&period=${period}&limit=800`);
-    series.push({ code: p.code, bars: d.bars || [], color: colorFor(p.code) });
+    const live = state.quotes[p.code] && state.quotes[p.code].last;
+    series.push({ code: p.code, bars: extendToNow(d.bars || [], live), color: colorFor(p.code) });
   }));
   state.compareSeries = series;
   drawChart();
+}
+
+/* 把分钟级以上曲线的最后一根「延伸到现在」：服务端最后完整 bar 的时间戳往往滞后于
+   真实时刻（1m 滞后约 1 分钟、日线滞后数小时），导致曲线悬空到不了右边缘；
+   1s/30s 已贴近现在则不延伸。延伸点取实时报价（取不到则用最后收盘），使曲线紧贴右边缘。 */
+function extendToNow(bars, price) {
+  if (!bars || !bars.length) return bars || [];
+  const last = bars[bars.length - 1];
+  const now = Date.now();
+  const lt = (typeof last.ts === 'number') ? last.ts : null;
+  if (lt == null || now - lt <= 30000) return bars;   // 1s/30s 已贴近现在
+  const c = (typeof price === 'number' && isFinite(price))
+    ? price : (last.c != null ? last.c : last.o);
+  if (c == null) return bars;
+  return bars.concat([{ ts: now, o: c, h: c, l: c, c: c, v: 0, _now: true }]);
 }
 
 async function loadHistory(code) {
@@ -312,7 +329,9 @@ function drawSingle() {
     ctx.beginPath(); ctx.arc(hx, y(closes[state.hover]), 3.2, 0, Math.PI * 2);
     ctx.fillStyle = lineColor; ctx.fill();
   }
-  $('#chartRange').textContent = `${fmtTs(bars[0].ts)} → ${fmtTs(bars[bars.length - 1].ts)}　共 ${bars.length} 根`;
+  const ext = bars.length && bars[bars.length - 1] && bars[bars.length - 1]._now;
+  const endLabel = ext ? '现在' : fmtTs(bars[bars.length - 1].ts);
+  $('#chartRange').textContent = `${fmtTs(bars[0].ts)} → ${endLabel}　共 ${bars.length - (ext ? 1 : 0)} 根`;
   $('#chartLegend').textContent = `收盘 ${fmt(closes[closes.length - 1], 2)}　区间 ${fmt(Math.min(...lows), 2)} ~ ${fmt(Math.max(...highs), 2)}`;
 }
 
@@ -378,7 +397,8 @@ function drawCompare() {
       ctx.fillStyle = s.color; ctx.fill();
     });
   }
-  $('#chartRange').textContent = `三品种对比 · 相对窗口首点涨跌幅　共 ${minLen} 根对齐`;
+  const ext = series[0].bars.length && series[0].bars[series[0].bars.length - 1]._now;
+  $('#chartRange').textContent = `三品种对比 · 相对窗口首点涨跌幅　共 ${minLen - (ext ? 1 : 0)} 根对齐`;
   $('#chartLegend').textContent = series.map((s) => `${productOf(s.code).short} ${s.color}`).join('　');
 }
 
@@ -724,6 +744,23 @@ $('#btnAutofill').addEventListener('click', async () => {
     await loadDbStatus();
   } catch (e) { toast('补全失败：' + e.message, 'err'); }
   $('#btnAutofill').disabled = false;
+});
+
+$('#btnRefreshFc').addEventListener('click', async () => {
+  const btn = $('#btnRefreshFc');
+  btn.disabled = true;
+  try {
+    const d = await postJSON('/api/forecast/refresh', {});
+    if (d && (d.forecasts || d.horizons || d.horizons === undefined)) {
+      if (d.forecasts) state.forecasts = d.forecasts;
+      renderHorizons();
+      renderIndicators();
+      toast('预测已刷新');
+    } else {
+      toast('刷新失败', 'err');
+    }
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  btn.disabled = false;
 });
 
 /* ------------------------------------------------------------- poll loop */

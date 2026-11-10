@@ -30,8 +30,8 @@ android {
         applicationId 'com.zpj.futures'
         minSdk 24
         targetSdk 34
-        versionCode 270
-        versionName '2.7.0'
+        versionCode 280
+        versionName '2.8.0'
     }
     signingConfigs {
         release {

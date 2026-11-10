@@ -1,7 +1,7 @@
 {
-  "version": "2.7.0",
-  "versionCode": 270,
+  "version": "2.8.0",
+  "versionCode": 280,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.7.0：服务端化与启动自检（端口 8123）。① 服务端成为唯一真源：将 App 核心能力（行情/预测/历史/设置）搬至 Web 前端（backend/app/static 四 tab 全覆盖），Android 端保留为独立 App 并默认指向 8123；后端时间序列统一毫秒整数、自然时间桶口径。② 启动自检补全：新增交易日历（backend/app/calendar.py，日盘 9:00–15:00 含 10:15–10:30、11:30–13:30 休市子窗口，夜盘 21:00–次日 01:00 跨午夜、跳过周末）与 autofill 模块（backend/app/autofill.py），服务启动时按交易日历逐段比对 1m 覆盖率，窗口内缺失自动回补、窗口外（Sina 1m 固定 1023 根物理不可补）如实标注，不阻塞 API 启动。③ 服务端大模型：新增 /api/llm/config（GET/POST，密钥存 DATA_DIR/llm.json 并 chmod 600，绝不入仓/库）与 /api/llm/analyze，复用七档预测生成趋势研判。④ 预测命中率历史：collector 每轮把七档预测落库 forecast_log（主键幂等），新增 /api/history 按 horizon 统计命中率（对应周期到期后有实际价可比对，短周期数分钟内即可出数）。⑤ 端口 8123：run.sh 默认 8123，run-lan.sh 同步示例改 8123；Android 端默认 server.base/db.base 与帮助文案改为 8123。"
+  "notes": "v2.8.0：分钟级曲线贴右边缘 + 原生多周期根治预测「数据不足」+ 同步近 3 天补缺。① 曲线贴右边缘（网页端 + Android 三品种对比）：分钟级以上（1m/5m/15m/30m/60m/1d）把最后已知价平铺延伸到「现在」，曲线右边缘不再比现价慢一拍；1s/30s 实时采集点维持原补尾逻辑。② 固定「近 3 天」比对窗口：仅 1m+ 做全量比对，1s/30s 仍只拉尾部，只补充缺失部分。③ 原生多周期落库（根治）：后端对三品种内盘（AL/AO）用 Sina 原生 5/15/30/60m 接口直采入库 kline_native，预测 5m/15m/30m 改用原生序列、彻底告别「样本不足」（外盘 AHD 4h 无原生源，如实保留「数据不足」）。④ 网页端预测页新增「刷新预测」按钮（POST /api/forecast/refresh，复用服务端最新序列重算七档并落库预测日志）。⑤ Android 数据下载同步：1m+ 走新增 GET /api/db/sync3d 取服务端权威「近 3 天」完整切片幂等补缺，根治手机 SQLite 中间数据点缺失；1s/30s 维持 tail-only（手机本机采集为真源）。"
 }

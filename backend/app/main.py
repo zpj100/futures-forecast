@@ -150,6 +150,35 @@ async def forecast(code: str | None = None):
             "meta": collector.state.snapshot_meta()}
 
 
+@app.post("/api/forecast/refresh")
+async def forecast_refresh(code: str | None = None):
+    """手动触发即时重算预测（网页端「刷新预测」按钮）。
+
+    复用 collector.state 的最新分钟/日线/原生序列，同步重算并写回 state、
+    落库预测日志，返回最新结果；CPU 密集建模放线程，避免阻塞。
+    """
+    codes = [code] if code and code in PRODUCT_BY_CODE else list(PRODUCT_BY_CODE)
+    try:
+        for c in codes:
+            p = PRODUCT_BY_CODE[c]
+            mm = _drop_future(collector.state.minute.get(c)
+                              or store.get_minute(c, 1200))
+            dd = _drop_future(collector.state.daily.get(c)
+                              or store.get_daily(c, 4500))
+            fc = await asyncio.to_thread(
+                forecast_one, c, p["name"], mm, dd, APP_HORIZONS,
+                native=collector.state.native.get(c))
+            collector.state.forecast[c] = fc
+            collector._log_forecast(c, fc)
+        collector.state.last_forecast_ts = time.time()
+        if code:
+            return collector.state.forecast.get(code, {})
+        return {"forecasts": collector.state.forecast,
+                "meta": collector.state.snapshot_meta()}
+    except Exception as e:  # noqa: BLE001
+        return _fail(e, "forecast/refresh")
+
+
 @app.get("/api/news")
 async def news(limit: int = Query(40, ge=5, le=200),
                code: str | None = None):
