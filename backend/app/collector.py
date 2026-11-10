@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
@@ -44,9 +45,32 @@ class State:
 state = State()
 
 
-def _err(msg: str) -> None:
-    state.errors.append(f"{datetime.now(timezone.utc):%H:%M:%S} {msg}")
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _brief(e: BaseException) -> str:
+    """把异常转成不含敏感 URL 的短摘要（HTTP 503 / timeout / 类名）。"""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status is not None:
+        return f"HTTP {status}"
+    low = str(e).lower()
+    if (isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            or "timeout" in low or "timed out" in low):
+        return "timeout"
+    return type(e).__name__
+
+
+def _err(summary: str) -> None:
+    """state.errors 只保留脱敏摘要；完整异常（含第三方 URL）由调用方写日志。"""
+    clean = _URL_RE.sub("<url>", " ".join(str(summary).split()))
+    state.errors.append(f"{datetime.now(timezone.utc):%H:%M:%S} {clean[:120]}")
     state.errors = state.errors[-20:]
+
+
+def _report(context: str, exc: BaseException) -> None:
+    """完整异常只写 logging.warning，对外只登记脱敏摘要（meta.errors 字段不变）。"""
+    log.warning("%s 失败: %s", context, exc)
+    _err(f"{context}: {_brief(exc)}")
 
 
 async def tick_snapshots() -> None:
@@ -60,17 +84,22 @@ async def tick_snapshots() -> None:
                 store.add_snapshot(code, q, int(now))
             if quotes:
                 state.last_quote_ts = now
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # noqa: BLE001
-            _err(f"snapshot: {e}")
+            _report("snapshot", e)
         await asyncio.sleep(SNAPSHOT_INTERVAL)
 
 
 async def tick_klines() -> None:
     """Refresh minute + daily klines and recompute forecasts."""
     while True:
+        errors: list[str] = []
         try:
-            mins = await sina.fetch_all_minute(1)
-            days = await sina.fetch_all_daily()
+            mins = await sina.fetch_all_minute(1, errors=errors)
+            days = await sina.fetch_all_daily(errors=errors)
+            for msg in errors:
+                _err(f"kline: {msg}")
             for code in PRODUCT_BY_CODE:
                 if mins.get(code):
                     store.upsert_minute(code, mins[code])
@@ -79,27 +108,46 @@ async def tick_klines() -> None:
                 # serve the DB (accumulated) merged with fresh bars
                 m = _drop_future(store.get_minute(code, 1200) or mins.get(code, []))
                 d = _drop_future(store.get_daily(code, 4500) or days.get(code, []))
-                state.minute[code] = m
-                state.daily[code] = d
+                # 本次无数据时不覆盖 state 里上次成功的数据
+                if m or code not in state.minute:
+                    state.minute[code] = m
+                if d or code not in state.daily:
+                    state.daily[code] = d
                 p = PRODUCT_BY_CODE[code]
-                state.forecast[code] = forecast_one(code, p["name"], m, d)
+                mm, dd = state.minute[code], state.daily[code]
+                if not mm and not dd and state.forecast.get(code):
+                    continue      # 保留上次成功预测
+                # 多周期增量落库：把本地累计 1m 按自然时间桶聚合成 5/15/30/60m，
+                # 只写尾部新桶/更新进行中桶，不每轮全量重写（1m 不插值、不伪造）。
+                if mm:
+                    store.sync_multi_incremental(code, mm)
+                # CPU 密集建模放线程，避免阻塞事件循环导致 WS/API 停摆
+                state.forecast[code] = await asyncio.to_thread(
+                    forecast_one, code, p["name"], mm, dd)
             state.last_kline_ts = time.time()
             state.last_forecast_ts = state.last_kline_ts
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # noqa: BLE001
-            _err(f"kline: {e}")
+            _report("kline", e)
         await asyncio.sleep(KLINE_INTERVAL)
 
 
 async def tick_news() -> None:
     while True:
+        errors: list[str] = []
         try:
-            items = await news.fetch_all()
+            items = await news.fetch_all(errors=errors)
+            for msg in errors:
+                _err(f"news: {msg}")
             if items:
                 store.upsert_news(items)
                 state.news = store.get_news(120)
                 state.last_news_ts = time.time()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:  # noqa: BLE001
-            _err(f"news: {e}")
+            _report("news", e)
         await asyncio.sleep(NEWS_INTERVAL)
 
 
@@ -108,6 +156,9 @@ async def bootstrap() -> None:
     for code in PRODUCT_BY_CODE:
         state.minute[code] = _drop_future(store.get_minute(code, 1200))
         state.daily[code] = _drop_future(store.get_daily(code, 4500))
+        # 冷启动也把库里已有的 1m 历史增量聚合成多周期，避免新增表长期为空
+        if state.minute[code]:
+            store.sync_multi_incremental(code, state.minute[code])
     state.news = store.get_news(120)
 
 

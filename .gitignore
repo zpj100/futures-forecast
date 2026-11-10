@@ -21,7 +21,14 @@ Thumbs.db
 android/.gradle/
 android/build/
 android/app/build/
-android/local.properties
+
+# 签名密钥 / 安装包 / 本机签名配置（含口令，绝不入库）
+*.jks
+*.keystore
+*.apk
+# 发行版 APK 按本项目惯例入库（Release 附件的本地副本），其余安装包一律忽略
+!releases/*.apk
+/android/local.properties
 
 # 预览/截图临时目录
 .preview/

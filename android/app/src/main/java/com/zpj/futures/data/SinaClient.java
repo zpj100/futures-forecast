@@ -46,11 +46,10 @@ public class SinaClient {
     }
 
     /**
-     * 带一次重试的 GET：先 HTTPS，失败再退 HTTP（源站两种协议都通）。
-     * 少数 ROM 的证书链过期或代理劫持会让 HTTPS 直接失败，退 HTTP 能救回来。
+     * 仅 HTTPS 的 GET（失败重试一次）。HTTPS 失败即返回错误，绝不降级到明文 HTTP：
+     * 明文行情可被中间人投毒，且 manifest/网络安全配置已全局禁用 cleartext。
      */
     private static String http(String url, String charset) throws Exception {
-        String fallback = url.startsWith("https://") ? "http://" + url.substring(8) : url;
         Exception last = null;
         for (int attempt = 0; attempt < 2; attempt++) {
             try {
@@ -65,11 +64,7 @@ public class SinaClient {
                 }
             }
         }
-        try {
-            return once(fallback, charset);
-        } catch (Exception e) {
-            throw last != null ? last : e;
-        }
+        throw last != null ? last : new IllegalStateException("HTTPS 行情请求失败");
     }
 
     private static String once(String url, String charset) throws Exception {

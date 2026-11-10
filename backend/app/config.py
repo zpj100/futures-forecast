@@ -51,15 +51,35 @@ PRODUCTS = [
 
 PRODUCT_BY_CODE = {p["code"]: p for p in PRODUCTS}
 
-# Forecast horizons: key -> (label, minutes)
+# 唯一的预测周期定义源：(key, label, minutes, series, step)
+#   series: "minute" 用 1 分钟序列按 step 分钟做时间桶聚合 / "daily" 用日线序列
+#   step  : 该档真实周期，既作为时间桶宽度，也作为前向标签的回看根数
+# main.py 的 /api/products 与 model/forecaster.py 都由此派生，避免重复硬编码。
 HORIZONS = [
-    ("1m", "1分钟", 1),
-    ("5m", "5分钟", 5),
-    ("10m", "10分钟", 10),
-    ("1h", "1小时", 60),
-    ("8h", "8小时", 480),
-    ("1d", "1天", 1440),
+    ("1m", "1分钟", 1, "minute", 1),
+    ("5m", "5分钟", 5, "minute", 5),
+    ("10m", "10分钟", 10, "minute", 10),
+    ("1h", "1小时", 60, "minute", 60),
+    ("8h", "8小时", 480, "daily", 1),
+    ("1d", "1天", 1440, "daily", 1),
 ]
+
+# App 对照接口使用的七档（与 Android Forecaster.HORIZONS 一致：1/5/15/30/240/480/1440 分钟）。
+# 既有 /api/forecast 仍只由 HORIZONS 六档驱动；forecast_one 通过可选参数切到本定义算七档，
+# 从而「30m/4h 用聚合序列补算」，样本不足时沿用 _empty 的「数据不足 / p_up=0.5」，不伪造精度。
+APP_HORIZONS = [
+    ("1m", "1分钟", 1, "minute", 1),
+    ("5m", "5分钟", 5, "minute", 5),
+    ("15m", "15分钟", 15, "minute", 15),
+    ("30m", "30分钟", 30, "minute", 30),
+    ("4h", "4小时", 240, "minute", 240),
+    ("8h", "8小时", 480, "daily", 1),
+    ("1d", "1天", 1440, "daily", 1),
+]
+
+# 多周期落库：从 1m 序列按「自然时间桶起点」聚合出的派生周期 (period, step 分钟)。
+# backend 内部只用这一种桶口径（毫秒 ts），与 Android aggregateByTime 一致。
+MULTI_PERIODS = [("5m", 5), ("15m", 15), ("30m", 30), ("60m", 60)]
 
 # Seconds between realtime snapshot captures (drives the "second-level" archive).
 SNAPSHOT_INTERVAL = int(os.getenv("FF_SNAPSHOT_INTERVAL", "3"))

@@ -59,6 +59,8 @@
         <div class="panel-title">技术指标 <span id="indBias" class="tag">—</span></div>
         <div class="ind-grid" id="indGrid"></div>
       </div>
+
+      <div class="server-compare" id="serverCompare" hidden></div>
     </section>
 
     <!-- ============ 预测 ============ -->
@@ -137,7 +139,7 @@
           <button class="btn ghost" id="btnLlmClear">清除 Key</button>
           <button class="btn" id="btnLlmSave">保存</button>
         </div>
-        <div class="hint">Key 仅存于本机，用系统密钥库加密，不会上传任何服务器。</div>
+        <div class="hint">Key 仅存于本机并用系统密钥库加密。填写自定义 API 地址时，行情提示词与 API Key 会发送到该地址，请仅使用可信的 HTTPS 服务；默认仅发往 api.deepseek.com。</div>
       </div>
 
       <div class="panel">
@@ -160,6 +162,18 @@
       </div>
 
       <div class="panel">
+        <div class="panel-title">服务端对照</div>
+        <div class="field-label">服务端地址（WSL 本机 FastAPI）</div>
+        <input id="serverBase" class="input" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000" autocapitalize="off" spellcheck="false" autocomplete="off">
+        <label class="chk server-toggle"><input type="checkbox" id="serverOn"><span>开启服务端数据：行情 / 预测取自服务端，用于双端对比</span></label>
+        <div class="row-btns">
+          <button class="btn ghost" id="btnServerTest">测试连接</button>
+        </div>
+        <div class="server-state" id="serverState">未开启</div>
+        <div class="hint">WSL 本机 FastAPI，开启后行情 / 预测取自服务端用于双端对比，连不上自动回退本地。</div>
+      </div>
+
+      <div class="panel">
         <div class="panel-title">本地数据</div>
         <div class="stat-row tight two" id="dataStats"></div>
         <div class="row-btns">
@@ -173,7 +187,7 @@
             <span id="syncProgPct">0%</span>
           </div>
         </div>
-        <div class="hint" id="syncInfo">同步先做最近 7 天体检：逐根比对源站与本地，缺失或整段被清空就回补，无缺失才走增量。源站每周期最多 1023 根（1 分钟线约 2 个交易日），补不到的会如实标出覆盖起点；秒级只能本机采集。</div>
+        <div class="hint" id="syncInfo">同步先体检最近 7 天完整性，再增量同步到最新（日线回溯 180 天）：逐根比对源站与本地，缺失或整段被清空就回补，无缺失才走增量。源站每周期最多 1023 根（1 分钟线约 2 个交易日），补不到的会如实标出覆盖起点；秒级只能本机采集。</div>
         <div class="row-btns">
           <button class="btn ghost danger" id="btnClearFc">清空预测记录</button>
         </div>

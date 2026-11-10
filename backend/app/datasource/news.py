@@ -140,17 +140,25 @@ async def fetch_ths(page: int = 1, size: int = 60) -> list[dict]:
     return out
 
 
-async def fetch_all() -> list[dict]:
-    """Fetch from every source; tolerate individual failures."""
+async def fetch_all(errors: list[str] | None = None) -> list[dict]:
+    """Fetch from every source; tolerate individual failures but surface them."""
     import asyncio
+    import logging
 
     tasks = [fetch_eastmoney("电解铝"), fetch_eastmoney("氧化铝"),
              fetch_eastmoney("伦铝"), fetch_ths()]
+    labels = ["eastmoney/电解铝", "eastmoney/氧化铝", "eastmoney/伦铝", "同花顺"]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     merged: list[dict] = []
-    for r in results:
+    for label, r in zip(labels, results):
         if isinstance(r, list):
             merged.extend(r)
+        else:
+            exc = r if isinstance(r, BaseException) else Exception(str(r))
+            # 详细异常（可能含第三方 URL）只写日志，对外登记脱敏摘要
+            logging.warning("news %s 拉取失败: %s", label, exc)
+            if errors is not None:
+                errors.append(f"{label}: {type(exc).__name__}")
     dedup: dict[str, dict] = {}
     for n in merged:
         dedup.setdefault(n["id"], n)

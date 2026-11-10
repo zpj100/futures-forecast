@@ -23,7 +23,14 @@
     chart: null,      // 当前图表几何，供十字星重绘
     crossTimer: 0,
     crossActive: false, // 按住十字星期间冻结曲线跟随
-    predBusy: false
+    predBusy: false,
+    lastSig: null,       // 上次渲染的「数据 + 视图」签名，5 秒定时拉取无变化时跳过重建
+    // 服务端对照开关：on/base 持久化到 localStorage，snap 为最近一次成功快照
+    server: {
+      on: false, base: 'http://127.0.0.1:8000', snap: null,
+      bars: [], snapCode: '', snapPeriod: '', lastBarTs: 0,
+      ts: 0, version: '', compareText: '', failUntil: 0
+    }
   };
 
   var PERIODS = [
@@ -129,31 +136,80 @@
 
   // ---------------- 数据拉取 ----------------
 
-  function pull() {
+  /**
+   * 变化检测签名：整份 state 快照（含最新报价时间戳、K 线尾点、统计/预测/同步时间等）
+   * 叠加当前品种 / 周期 / 对比 / 配色。任一变化才需要重新取数与重建 DOM。
+   */
+  function stateSig(raw) {
+    var ps = (S.state && S.state.products) || [];
+    var qts = 0;   // 最新报价时间戳：图表最后一根（尾点）随它变化
+    ps.forEach(function (p) {
+      var t = p.quote && p.quote.ts;
+      if (t && t > qts) qts = t;
+    });
+    // 服务端模式：用快照 K 线末根 ts 作为数据版本信号。不能把每次都变化的
+    // snap.server.ts 或整份快照 JSON 放进签名，否则 5 秒轮询会反复重建 DOM。
+    var srv = (S.server.on && S.server.snap)
+      ? '|srv:' + (S.server.lastBarTs || 0) : '';
+    return [raw, qts, S.code, S.period, S.compare ? 1 : 0, isLight() ? 1 : 0, srv].join('|');
+  }
+
+  /** force=true 用于显式刷新（启动 / 手动刷新 / native 推送 / 预测或同步完成），始终重绘。 */
+  function pull(force) {
     var raw = null;
-    try {
-      raw = DEMO ? JSON.stringify(demoState()) : N.state();
-    } catch (e) {
-      setLive('读取失败', 'err');
-      return;
+    var served = false;
+    // 服务端对照：单次 pull 只发一次 serverGet；失败冷却期内（定时轮询）先用本地
+    if (S.server.on && N && typeof N.serverGet === 'function'
+        && (force || Date.now() >= (S.server.failUntil || 0))) {
+      try {
+        var snap = JSON.parse(N.serverGet(snapshotPath()));
+        if (!snap || snap.error || !snap.state || !snap.kline) {
+          throw new Error((snap && snap.error) || '服务端返回异常');
+        }
+        applySnapshot(snap);       // 映射成同构 S.state + 缓存 bars，复用现有渲染函数
+        S.server.failUntil = 0;
+        raw = 'server';            // 稳定占位；真实变化信号由 stateSig 的 srv 段负责
+        served = true;
+      } catch (e) {
+        serverFallback(e);         // 提示 + 清快照 + 冷却，绝不中断下面的本地渲染
+      }
     }
-    if (!raw) return;
-    try {
-      S.state = JSON.parse(raw);
-    } catch (e) {
-      return;
+    if (!served) {
+      clearServerSnap();
+      try {
+        raw = DEMO ? JSON.stringify(demoState()) : N.state();
+      } catch (e) {
+        setLive('读取失败', 'err');
+        return;
+      }
+      if (!raw) return;
+      try {
+        S.state = JSON.parse(raw);
+      } catch (e) {
+        return;
+      }
     }
     // 选中品种保持有效
     var codes = (S.state.products || []).map(function (p) { return p.code; });
     if (codes.length && codes.indexOf(S.code) < 0) S.code = codes[0];
+
+    var sig = stateSig(raw);
+    var live = function () {
+      if (S.state.last_error) setLive('数据源异常', 'err');
+      else setLive('已更新 ' + nowStr(), 'ok');
+    };
+    if (!force && sig === S.lastSig) {
+      // 5 秒定时拉取但数据未变化：跳过卡片重建、K 线重取、迷你走势与监听器绑定
+      live();
+      return;
+    }
+    S.lastSig = sig;
     renderQuotes();
     if (!S.crossActive) renderChart();   // 按住十字星时先冻结，松手后再跟最新
     renderIndicators();
     renderForecast();
     renderStats();
-    var err = S.state.last_error;
-    if (err) setLive('数据源异常', 'err');
-    else setLive('已更新 ' + nowStr(), 'ok');
+    live();
   }
 
   // ---------------- 行情 ----------------
@@ -181,15 +237,7 @@
         + '</div>';
     });
     box.innerHTML = html;
-    Array.prototype.forEach.call(box.querySelectorAll('.qcard'), function (el) {
-      el.addEventListener('click', function () {
-        S.code = el.getAttribute('data-code');
-        renderQuotes();
-        renderChart();
-        renderIndicators();
-        renderForecast();
-      });
-    });
+    // 卡片点击统一由 #quoteCards 上的事件委托处理（见 bind），这里不再重复绑定监听器
     // 迷你走势
     Array.prototype.forEach.call(box.querySelectorAll('canvas[data-spark]'), function (cv) {
       var code = cv.getAttribute('data-spark');
@@ -238,6 +286,12 @@
 
   /** 取某品种某周期的序列，统一成 [ts,o,h,l,c,v] 数组。 */
   function loadBars(code, period) {
+    // 服务端对照：当前品种 + 当前周期命中快照时，直接复用映射好的服务端 bars，
+    // 早返回不追加本地报价，避免把两端数据混在一根曲线上。
+    if (S.server.on && S.server.snap && S.server.bars && S.server.bars.length
+        && code === S.server.snapCode && period.k === S.server.snapPeriod) {
+      return S.server.bars.slice();
+    }
     var out = [];
     if (DEMO) return demoSeries(code, period);
     try {
@@ -754,8 +808,9 @@
 
   function renderStats() {
     var st = (S.state && S.state.stats) || {};
+    // 每次都重取命中率，保证验证结果回填后数值即时刷新（不再只在首次渲染时取一次）
     var row = $('#statRow');
-    if (row && row.children.length === 0) {
+    if (row) {
       try {
         var hs = JSON.parse(DEMO ? '{"verified":0,"hit":0,"rate":0}' : N.hitStats());
         row.innerHTML = statCell('已验证', hs.verified || 0)
@@ -777,7 +832,7 @@
       if (info && info.getAttribute('data-busy') !== '1') {
         info.textContent = (S.state.last_sync ? '上次同步 ' + timeStr(S.state.last_sync) : '尚未同步')
           + (S.state.last_sync_msg ? '：' + S.state.last_sync_msg : '')
-          + '。每次同步先体检最近 7 天（缺失或整段清空自动回补），无缺口才只补增量再顺延到最新。'
+          + '。同步先体检最近 7 天完整性，再增量同步到最新（日线回溯 180 天）。'
           + (S.syncNote ? '\n' + S.syncNote : '');
       }
     }
@@ -841,13 +896,235 @@
     return p ? p.short : code;
   }
 
+  // ---------------- 服务端对照 ----------------
+
+  function snapshotPath() {
+    return '/api/app/snapshot?code=' + encodeURIComponent(S.code)
+      + '&period=' + encodeURIComponent(S.period) + '&limit=400';
+  }
+
+  function saveServerPrefs() {
+    try {
+      localStorage.setItem('ff_server_on', S.server.on ? '1' : '0');
+      localStorage.setItem('ff_server_base', S.server.base);
+    } catch (e) { /* ignore */ }
+  }
+
+  function clearServerSnap() {
+    S.server.snap = null;
+    S.server.bars = [];
+    S.server.lastBarTs = 0;
+    S.server.compareText = '';
+    var el = $('#serverCompare');
+    if (el) el.hidden = true;
+  }
+
+  /** 状态行（设置页 #serverState）与行情页对照行（#serverCompare）统一出口。 */
+  function paintServerNote(base, cmp, cls) {
+    var st = $('#serverState');
+    if (st) {
+      st.className = 'server-state' + (cls ? ' ' + cls : '');
+      st.innerHTML = esc(base) + (cmp ? '<br><span class="server-cmp">' + esc(cmp) + '</span>' : '');
+    }
+    var el = $('#serverCompare');
+    if (el) {
+      if (cmp) { el.textContent = cmp; el.hidden = false; }
+      else el.hidden = true;
+    }
+  }
+
+  function productIn(state, code) {
+    var ps = (state && state.products) || [];
+    for (var i = 0; i < ps.length; i++) if (ps[i].code === code) return ps[i];
+    return null;
+  }
+
+  /** 服务端 quote 未必含 change_pct，用 last/prev_close 补算，保持 renderQuotes 零改动。 */
+  function mapQuote(q) {
+    q = q || {};
+    var last = (q.last !== undefined && q.last !== null) ? q.last : q.price;
+    var prev = (q.prev_close !== undefined && q.prev_close !== null) ? q.prev_close : q.pre_close;
+    var chg = q.change_pct;
+    if ((chg === undefined || chg === null) && last != null && prev) {
+      chg = (last - prev) / prev * 100;
+    }
+    return {
+      last: last, open: q.open, high: q.high, low: q.low,
+      prev_close: prev, change_pct: chg
+      // 故意不写 ts：避免每变的 server.ts 进入 stateSig 的 qts 段
+    };
+  }
+
+  /** 把 snapshot 映射成本地同构的 S.state，并缓存服务端 bars 供 loadBars 复用。 */
+  function applySnapshot(snap) {
+    var st = snap.state || {};
+    var kline = snap.kline || {};
+    var fc = snap.forecast || {};
+    var srv = snap.server || {};
+
+    var bars = [];
+    (kline.bars || []).forEach(function (b) {
+      bars.push([b.ts, b.o, b.h, b.l, b.c, b.v]);
+    });
+    S.server.snap = snap;
+    S.server.bars = bars;
+    S.server.snapCode = S.code;
+    S.server.snapPeriod = S.period;
+    S.server.lastBarTs = bars.length ? bars[bars.length - 1][0] : 0;
+    S.server.ts = srv.ts || 0;
+    S.server.version = srv.version || '';
+
+    var products = (st.products || []).map(function (p) {
+      var prod = {
+        code: p.code, short: p.short || p.code, name: p.name || '', unit: p.unit || '',
+        quote: mapQuote(p.quote),
+        minute_bars: p.minute_bars, daily_bars: p.daily_bars
+      };
+      // 服务端 forecast 只有当前品种一份，挂到当前品种即可复用 renderForecast/renderIndicators
+      if (p.code === S.code) prod.forecast = fc;
+      return prod;
+    });
+    var periods = st.periods || {};
+    S.state = {
+      products: products,
+      periods: periods,
+      stats: {
+        periods: periods,
+        daily: (periods['1d'] || {}).n || 0,
+        minute: (periods['1m'] || {}).n || 0,
+        forecasts: 0
+      },
+      last_sync: st.last_sync || 0,
+      last_error: st.last_error || '',
+      last_tick: st.last_tick || 0
+    };
+    buildCompareLine(snap);
+    paintServerNote('已连接 · 服务端 v' + (S.server.version || '?'), S.server.compareText, 'ok');
+  }
+
+  /** 对照行：服务端模式下再取一次本地 N.state()，生成一行双端对比文本。 */
+  function buildCompareLine(snap) {
+    var line;
+    try {
+      var local = N ? JSON.parse(N.state()) : null;
+      var lp = productIn(local, S.code);
+      var sp = productIn(snap.state, S.code);
+      var lq = (lp && lp.quote) || {};
+      var sq = (sp && sp.quote) || {};
+      var lLast = lq.last;
+      var sLast = (sq.last !== undefined && sq.last !== null) ? sq.last
+        : ((snap.forecast && snap.forecast.price) || null);
+      var lps = (local && local.stats && local.stats.periods) || {};
+      var lN = (lps[S.period] && lps[S.period].n) || 0;
+      var sN = ((snap.kline && snap.kline.bars) || []).length;
+      var lf = lp && lp.forecast;
+      var lDir = (lf && (lf.overall || (lf.horizons && lf.horizons[0] && lf.horizons[0].direction))) || '—';
+      var sDir = (snap.forecast && snap.forecast.overall) || '—';
+      line = '服务端对照 · 报价 本地 ' + (lLast != null ? num(lLast, 2) : '—')
+        + ' / 服务端 ' + (sLast != null ? num(sLast, 2) : '—')
+        + ' · 当前周期根数 ' + lN + '/' + sN
+        + ' · 预测方向 本地' + lDir + '/服务端' + sDir;
+    } catch (e) {
+      line = '服务端对照 · 本地数据读取失败：' + ((e && e.message) || e);
+    }
+    S.server.compareText = line;
+  }
+
+  /** 服务端不可用：清快照、提示，并把定时轮询冷却 30 秒，避免 5 秒超时反复卡主线程。 */
+  function serverFallback(e) {
+    clearServerSnap();
+    S.server.failUntil = Date.now() + 30000;
+    var msg = (e && e.message) ? e.message : String(e || '未知错误');
+    paintServerNote('服务端不可用，已回退本地：' + msg, '', 'err');
+  }
+
+  function initServer() {
+    try {
+      var b = localStorage.getItem('ff_server_base');
+      if (b) S.server.base = b;
+      S.server.on = localStorage.getItem('ff_server_on') === '1';
+    } catch (e) { /* ignore */ }
+    var bi = $('#serverBase'), ci = $('#serverOn');
+    if (bi) bi.value = S.server.base;
+    if (ci) ci.checked = S.server.on;
+    if (N && typeof N.setServer === 'function') {
+      try {
+        N.setServer(S.server.base, S.server.on);
+      } catch (e) {
+        S.server.on = false;
+        if (ci) ci.checked = false;
+        saveServerPrefs();
+        paintServerNote('保存的服务端地址无效，已恢复本地：' + ((e && e.message) || e), '', 'err');
+      }
+    }
+    if (S.server.on) paintServerNote('服务端模式已开启', '', 'ok');
+  }
+
+  function onServerToggle() {
+    var ci = $('#serverOn'), bi = $('#serverBase');
+    if (bi) S.server.base = bi.value.trim() || S.server.base;
+    S.server.on = !!(ci && ci.checked);
+    S.server.failUntil = 0;
+    saveServerPrefs();
+    var err = '';
+    try {
+      if (N && typeof N.setServer === 'function') N.setServer(S.server.base, S.server.on);
+    } catch (e) {
+      err = (e && e.message) ? e.message : String(e);
+      S.server.on = false;
+      if (ci) ci.checked = false;
+      saveServerPrefs();
+    }
+    if (err) {
+      clearServerSnap();
+      paintServerNote('地址无效，已恢复本地：' + err, '', 'err');
+    } else if (S.server.on) {
+      paintServerNote('服务端模式已开启，正在取数…', '', 'ok');
+    } else {
+      clearServerSnap();
+      paintServerNote('已关闭，使用本地数据', '', '');
+    }
+    S.lastSig = null;
+    pull(true);
+  }
+
+  function onServerTest() {
+    var bi = $('#serverBase');
+    var base = (bi && bi.value.trim()) || S.server.base;
+    S.server.base = base;
+    saveServerPrefs();
+    paintServerNote('正在测试连接…', '', '');
+    try {
+      if (!N || typeof N.setServer !== 'function' || typeof N.serverGet !== 'function') {
+        throw new Error('当前环境不支持 Native');
+      }
+      N.setServer(base, true);
+      var j = JSON.parse(N.serverGet('/api/app/state'));
+      if (j && j.error) throw new Error(j.error);
+      var prods = (j && j.products) || [];
+      var ver = (j && (j.server_version || (j.server && j.server.version))) || '?';
+      var per = (j && j.periods) || {};
+      var cnt = Object.keys(per).map(function (k) {
+        return k + ':' + ((per[k] && per[k].n) || 0);
+      }).join(' ');
+      paintServerNote('已连接 · 服务端 v' + ver + ' · ' + prods.length + ' 品种 · 各周期根数 '
+        + (cnt || '—'), S.server.on ? S.server.compareText : '', 'ok');
+    } catch (e) {
+      paintServerNote('连接失败：' + ((e && e.message) ? e.message : String(e)), '', 'err');
+    }
+    // 还原 native 开关到前端当前状态，避免一次测试改变持久化的开关
+    try {
+      if (N && typeof N.setServer === 'function') N.setServer(base, S.server.on);
+    } catch (e2) { /* ignore */ }
+  }
+
   // ---------------- 设置 ----------------
 
   function loadSettings() {
     var s = {};
     try {
       s = JSON.parse(DEMO
-        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.4.0"}'
+        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.5.0"}'
         : N.settings());
     } catch (e) { s = {}; }
     S.settings = s;
@@ -1090,7 +1367,7 @@
         + (res.warn ? '\n' + res.warn : '');
     }
     toast('同步完成：' + head);
-    pull();
+    pull(true);
   }
 
   function onPredictStep(step) {
@@ -1107,6 +1384,9 @@
       b.disabled = false;
       b.textContent = '更新预测';
     }
+    // 成功 / 失败都解除 #predInfo 的 busy 锁，避免 renderForecastMeta 永久跳过导致文本冻结
+    var info = $('#predInfo');
+    if (info) info.removeAttribute('data-busy');
     if (!res || !res.ok) {
       var m = (res && res.message) || '刷新失败';
       progSet('#predProgWrap', 0, m, 'fail');
@@ -1116,12 +1396,13 @@
     progSet('#predProgWrap', 100,
       (res.message || '已更新') + '（分钟线 ' + (res.added_minute || 0)
       + ' / 日线 ' + (res.added_daily || 0) + ' 根）', 'done');
-    // 立刻回填时间戳，避免下面的 pull → renderForecastMeta 又显示「尚未更新」
+    toast(res.message || '预测已更新');
+    // 先 pull 再回填：pull 会整体替换 S.state，回填必须放在其后才不会被覆盖；
+    // res 里并没有 next_forecast，下次自动时间以 native state 为准。
+    pull(true);
     S.state = S.state || {};
     S.state.last_forecast = res.forecast_at || Date.now();
-    if (res.next_forecast) S.state.next_forecast = res.next_forecast;
-    toast(res.message || '预测已更新');
-    pull();
+    renderForecastMeta();
   }
 
   /** 预测时间提示：上次/下次自动刷新。 */
@@ -1149,7 +1430,7 @@
     if (btn) { btn.disabled = true; btn.textContent = '立即更新'; }
     progSet('#updProgWrap', 0, '正在读取 Gitee 发行版信息…', 'indet');
     if (DEMO) {
-      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.4.0（演示）' });
+      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.5.0（演示）' });
       return;
     }
     try { N.checkUpdate(); } catch (e) {
@@ -1177,25 +1458,35 @@
   function onUpdateProgress(o) {
     if (!o) return;
     var btn = $('#btnUpdateInstall');
-    if (o.phase === 'check') {
+    var phase = o.phase;
+    if (phase === 'check') {
       // pct=0 表示还在读发行版（不确定态），之后是解析附件/安装包的确定进度
       progSet('#updProgWrap', o.pct || 0, o.msg || '正在检查更新…',
         (o.pct || 0) > 0 ? '' : 'indet');
       return;
     }
-    if (o.phase === 'error') {
+    if (phase === 'error') {
+      // 失败文案由 native 脱敏，直接展示；保留失败态红轨、右侧「失败」、按钮「重试更新」
       S.upd = { phase: 'fail' };
-      progFail(S.updPct || 0, '下载失败，可点「重试更新」直接再试，无需重新检查');
+      progFail(S.updPct || 0, o.msg || o.message || '下载失败');
       if (btn) { btn.disabled = false; btn.textContent = '重试更新'; }
       return;
     }
-    if (o.phase === 'done') {
+    if (phase === 'done') {
       S.upd = { phase: 'done' };
-      progSet('#updProgWrap', 100, '下载完成，正在调起系统安装器…', 'done');
+      // 强制 100%：无论 size / 已下载字节为多少，完成态都要满格
+      progSet('#updProgWrap', 100, '正在调起系统安装器', 'done');
       if (btn) { btn.disabled = true; btn.textContent = '下载完成'; }
       return;
     }
-    if (o.phase === 'start' || !o.done) {
+    if (phase === 'need_permission') {
+      // 已下载并通过校验，但未获「安装未知应用」权限：按钮改为可点的「继续安装」
+      S.upd = { phase: 'need_permission' };
+      progSet('#updProgWrap', 100, '安装包已就绪，点「继续安装」授权后安装', '');
+      if (btn) { btn.disabled = false; btn.textContent = '继续安装'; }
+      return;
+    }
+    if (phase === 'start') {
       S.upd = { phase: 'connecting' };
       S.updT0 = Date.now();
       progSet('#updProgWrap', 0,
@@ -1203,6 +1494,7 @@
       if (btn) { btn.disabled = true; btn.textContent = '下载中…'; }
       return;
     }
+    // 其余均为下载进度（含 done=0 的首帧）：显式按 phase 分流，避免 0 字节被 !o.done 误判成重下起点
     var known = o.total > 0;
     var txt = '下载中 ' + mb(o.done) + (known ? ' / ' + mb(o.total) : '') + ' MB';
     var sec = S.updT0 ? (Date.now() - S.updT0) / 1000 : 0;
@@ -1278,6 +1570,18 @@
       });
     });
 
+    // 行情卡片：事件委托只在容器上绑定一次，避免每次 innerHTML 重建都重复 addEventListener
+    $('#quoteCards').addEventListener('click', function (e) {
+      var el = e.target.closest('.qcard');
+      if (!el) return;
+      S.code = el.getAttribute('data-code');
+      if (S.server.on) { pull(true); return; }   // 服务端模式按新品种重取 snapshot
+      renderQuotes();
+      renderChart();
+      renderIndicators();
+      renderForecast();
+    });
+
     // 周期 chips
     var pc = $('#periodChips');
     pc.innerHTML = PERIODS.map(function (p) {
@@ -1289,7 +1593,8 @@
         Array.prototype.forEach.call(pc.querySelectorAll('.chip'), function (x) {
           x.classList.toggle('on', x === b);
         });
-        renderChart();
+        if (S.server.on) pull(true);   // 服务端模式按新周期重取 snapshot
+        else renderChart();
       });
     });
 
@@ -1405,9 +1710,9 @@
     $('#btnRefresh').addEventListener('click', function () {
       var btn = this;
       btn.classList.add('spin');
-      if (DEMO) { setTimeout(function () { btn.classList.remove('spin'); pull(); }, 500); return; }
+      if (DEMO) { setTimeout(function () { btn.classList.remove('spin'); pull(true); }, 500); return; }
       try { N.refresh(); } catch (e) { /* ignore */ }
-      setTimeout(function () { btn.classList.remove('spin'); pull(); }, 1200);
+      setTimeout(function () { btn.classList.remove('spin'); pull(true); }, 1200);
     });
 
     // 大模型
@@ -1431,11 +1736,29 @@
       if (v) { saveSettings({ gitee_token: v }); this.value = ''; }
     });
     $('#btnUpdateCheck').addEventListener('click', checkUpdate);
-    // 一键续跑：检查失败 → 重试检查；下载失败 → 直接重下（不用先重新检查）
+    // 一键续跑：检查失败 → 重试检查；缺安装权限 → 直接装缓存 APK（不重下）；下载失败 → 直接重下
     $('#btnUpdateInstall').addEventListener('click', function () {
       var o = S.update;
       var phase = (S.upd && S.upd.phase) || '';
+      var btn = this;
       if (phase === 'fail' && (!o || !o.has_update)) { checkUpdate(); return; }
+      if (phase === 'need_permission') {
+        // 已下载且校验通过，native 直接用 check 缓存安装，不再重新下载
+        if (DEMO || !N || typeof N.installCachedUpdate !== 'function') {
+          toast('当前环境不支持继续安装');
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = '正在安装…';
+        try {
+          N.installCachedUpdate();
+        } catch (e) {
+          btn.disabled = false;
+          btn.textContent = '继续安装';
+          toast('安装失败：' + e.message);
+        }
+        return;
+      }
       if (!o || !o.has_update) return;
       startDownload(o);
     });
@@ -1504,17 +1827,29 @@
       Array.prototype.forEach.call(qc.querySelectorAll('.chip'), function (x) {
         x.classList.toggle('on', x === b);
       });
+      if (S.server.on) { pull(true); return; }   // 服务端模式按新品种重取 snapshot
       renderQuotes();
       renderChart();
       renderIndicators();
       renderForecast();
+    });
+
+    // 服务端对照：开关 / 测试连接 / 地址输入
+    var sOn = $('#serverOn');
+    if (sOn) sOn.addEventListener('change', onServerToggle);
+    var sTest = $('#btnServerTest');
+    if (sTest) sTest.addEventListener('click', onServerTest);
+    var sBase = $('#serverBase');
+    if (sBase) sBase.addEventListener('change', function () {
+      S.server.base = sBase.value.trim() || S.server.base;
+      saveServerPrefs();
     });
   }
 
   // ---------------- Native 回调 ----------------
 
   window.FF = {
-    onData: function () { pull(); },
+    onData: function () { pull(true); },
     onLlm: function (res) { onLlm(res); },
     onUpdate: function (o) { onUpdate(o); },
     onUpdateProgress: function (o) { onUpdateProgress(o); },
@@ -1637,7 +1972,8 @@
   // ---------------- 启动 ----------------
 
   bind();
-  pull();
+  initServer();   // 先恢复服务端开关，再让首次 pull 用正确的模式取数
+  pull(true);
   loadSettings();
   setInterval(function () {
     if (S.tab === 'market' || S.tab === 'forecast') pull();

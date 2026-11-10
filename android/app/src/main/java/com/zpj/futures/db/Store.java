@@ -87,11 +87,14 @@ public class Store extends SQLiteOpenHelper {
     /** 返回最近 limit 条快照，按时间升序。元素为 [ts, price]。 */
     public List<double[]> recentTicks(String code, int limit) {
         List<double[]> out = new ArrayList<>();
+        int lim = Math.max(1, Math.min(5000, limit));
+        // 先按 DESC 取最近 lim 条，外层 ASC 排回时间正序；直接尾部追加，避免 out.add(0,..) 的 O(n²)
         Cursor c = getReadableDatabase().rawQuery(
-                "SELECT ts, price FROM ticks WHERE code=? ORDER BY ts DESC LIMIT ?",
-                new String[]{code, String.valueOf(limit)});
+                "SELECT ts, price FROM (SELECT ts, price FROM ticks WHERE code=?"
+                        + " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC",
+                new String[]{code, String.valueOf(lim)});
         try {
-            while (c.moveToNext()) out.add(0, new double[]{c.getLong(0), c.getDouble(1)});
+            while (c.moveToNext()) out.add(new double[]{c.getLong(0), c.getDouble(1)});
         } finally {
             c.close();
         }
@@ -108,21 +111,19 @@ public class Store extends SQLiteOpenHelper {
      * 实际是 30 秒一个点，界面必须如实说明。
      */
     public List<double[]> tickSeries(String code, int bucketSec, int limit) {
+        // 先 clamp：防负 LIMIT、防 bucketSec*1000L*max 溢出 long、防聚合分支无界读取
+        int bsec = Math.max(0, Math.min(3600, bucketSec));
+        int lim = Math.max(1, Math.min(5000, limit));
+        int max = Math.max(2, lim);
         List<double[]> out = new ArrayList<>();
-        int max = Math.max(2, limit);
         long now = System.currentTimeMillis();
-        long window = bucketSec > 0
-                ? Math.max(bucketSec, 1) * 1000L * max * 2L
-                : 86400_000L;
-        // 原始点可能很多（30 天 × 每次采集 1 点），先按时间窗截断再取尾部
-        String sql = bucketSec > 0
-                ? "SELECT ts, price FROM ticks WHERE code=? AND ts>=? ORDER BY ts ASC"
-                : "SELECT ts, price FROM (SELECT ts, price FROM ticks WHERE code=? AND ts>=?"
+        long window = bsec > 0 ? (long) bsec * 1000L * max * 2L : 86400_000L;
+        // 原始点上限（聚合后桶数远小于点数）：两个分支共用同一条带 LIMIT 的 SQL
+        long rawCap = max * 50L;
+        String sql = "SELECT ts, price FROM (SELECT ts, price FROM ticks WHERE code=? AND ts>=?"
                 + " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC";
-        Cursor c = bucketSec > 0
-                ? getReadableDatabase().rawQuery(sql, new String[]{code, String.valueOf(now - window)})
-                : getReadableDatabase().rawQuery(sql,
-                new String[]{code, String.valueOf(now - window), String.valueOf(max)});
+        Cursor c = getReadableDatabase().rawQuery(sql,
+                new String[]{code, String.valueOf(now - window), String.valueOf(rawCap)});
         try {
             double curO = 0, curH = 0, curL = 0, curC = 0;
             long curTs = 0;
@@ -130,7 +131,7 @@ public class Store extends SQLiteOpenHelper {
             while (c.moveToNext()) {
                 long ts = c.getLong(0);
                 double p = c.getDouble(1);
-                long b = bucketSec > 0 ? (ts / (bucketSec * 1000L)) * (bucketSec * 1000L) : ts;
+                long b = bsec > 0 ? (ts / (bsec * 1000L)) * (bsec * 1000L) : ts;
                 if (cnt > 0 && b != curTs) {
                     out.add(new double[]{curTs, curO, curH, curL, curC, cnt});
                     cnt = 0;
@@ -181,13 +182,15 @@ public class Store extends SQLiteOpenHelper {
 
     public List<Bar> klines(String code, String period, int limit) {
         List<Bar> out = new ArrayList<>();
+        int lim = Math.max(1, Math.min(5000, limit));
+        // DESC 取最近 lim 根，外层 ASC 排回时间正序；直接尾部追加，消除头插 O(n²)
         Cursor c = getReadableDatabase().rawQuery(
-                "SELECT ts,o,h,l,c,v FROM kline WHERE code=? AND period=?"
-                        + " ORDER BY ts DESC LIMIT ?",
-                new String[]{code, period, String.valueOf(limit)});
+                "SELECT ts,o,h,l,c,v FROM (SELECT ts,o,h,l,c,v FROM kline"
+                        + " WHERE code=? AND period=? ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC",
+                new String[]{code, period, String.valueOf(lim)});
         try {
             while (c.moveToNext()) {
-                out.add(0, new Bar(c.getLong(0), c.getDouble(1), c.getDouble(2),
+                out.add(new Bar(c.getLong(0), c.getDouble(1), c.getDouble(2),
                         c.getDouble(3), c.getDouble(4), c.getDouble(5)));
             }
         } finally {
@@ -225,10 +228,16 @@ public class Store extends SQLiteOpenHelper {
 
     // ---------------- 体检辅助（同步前完整性检查用） ----------------
 
-    /** 某周期在 sinceMs 之后本地有多少根。 */
+    /** 某周期在 sinceMs 之后本地有多少根（参数化查询，杜绝拼接注入）。 */
     public int countKlineSince(String code, String period, long sinceMs) {
-        return scalar("SELECT COUNT(*) FROM kline WHERE code='" + sqlStr(code)
-                + "' AND period='" + sqlStr(period) + "' AND ts>=" + sinceMs);
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM kline WHERE code=? AND period=? AND ts>=?",
+                new String[]{code, period, String.valueOf(sinceMs)});
+        try {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        } finally {
+            c.close();
+        }
     }
 
     /** sinceMs 之后本地已有的全部时间戳（用于和源站逐根比对，找出空洞）。 */
@@ -267,10 +276,6 @@ public class Store extends SQLiteOpenHelper {
         } finally {
             c.close();
         }
-    }
-
-    private static String sqlStr(String s) {
-        return s == null ? "" : s.replace("'", "''");
     }
 
     // ---------------- forecasts ----------------

@@ -35,24 +35,75 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
+from ..config import HORIZONS as HORIZON_DEFS
 from .features import build_features, ema, indicators, rsi
 
-
-HORIZON_DEFS = [
-    ("1m", "1分钟", 1, "minute", 1),
-    ("5m", "5分钟", 5, "minute", 5),
-    ("10m", "10分钟", 10, "minute", 10),
-    ("1h", "1小时", 60, "minute", 60),
-    ("8h", "8小时", 480, "daily", 1),
-    ("1d", "1天", 1440, "daily", 1),
-]
+# 市场时间戳为北京时间（CST），用于把 1m bar 的 "t"/"ts" 解析为绝对 epoch。
+_CST = timezone(timedelta(hours=8))
 
 _MIN_SAMPLES = 120
-_FOLD_FRACTION = 0.45   # fraction of window used for out-of-sample folds
+_FOLD_FRACTION = 0.30   # 前 70% 训练 / 后 30% 走向外验证，与 README 一致
 _FOLDS = 4
+
+
+# ----------------------------------------------------------- time buckets
+
+def _bar_ts_ms(value) -> int | None:
+    """把 bar 时间戳解析为 epoch 毫秒；无法解析返回 None。
+
+    兼容 "YYYY-MM-DD HH:MM:SS"、"YYYY-MM-DD" 以及 ISO 8601（T / 时区 / Z）。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_CST)
+    return int(dt.timestamp() * 1000)
+
+
+def _aggregate_minute_bars(bars: list[dict], step: int) -> list[dict]:
+    """按时间桶把 1m 序列聚合成该档真实周期（与 Android aggregateByTime 同算法）。
+
+    桶起点 = ts - floorMod(ts, step*60_000)；
+    OHLC = 首 open / 末 close / max high / min low / sum vol。
+    step<=1 直接返回原序列。
+    """
+    if step <= 1:
+        return list(bars)
+    bucket = step * 60_000
+    out: dict[int, dict] = {}
+    for b in bars:
+        ts = _bar_ts_ms(b.get("ts") or b.get("t"))
+        c = b.get("c")
+        if ts is None or c is None:
+            continue
+        start = ts - ts % bucket          # 与 Math.floorMod 对齐（ts 恒为正）
+        o = b.get("o") or c
+        h = b.get("h") or c
+        l = b.get("l") or c
+        v = b.get("v") or 0.0
+        cur = out.get(start)
+        if cur is None:
+            out[start] = {"o": o, "h": h, "l": l, "c": c, "v": v}
+        else:
+            cur["h"] = max(cur["h"], h)
+            cur["l"] = min(cur["l"], l)
+            cur["c"] = c
+            cur["v"] = cur["v"] + v
+    return [out[k] for k in sorted(out)]
 
 
 def _phi(z: float) -> float:
@@ -139,17 +190,12 @@ def _walk_forward_eval(builder, close: np.ndarray, fwd_sign: np.ndarray,
 # ----------------------------------------------------------------- features
 
 def _ridge_forecast(close: np.ndarray, high: np.ndarray, low: np.ndarray,
-                    vol: np.ndarray, step: int, use_intraday: bool,
-                    intraday: list[dict] | None):
+                    vol: np.ndarray, step: int):
     """Optional ridge model; returns (edge_log, hit, resid_std) or None."""
     X, _ = build_features(close, high, low, vol)
-    if use_intraday and intraday and len(intraday) >= 60:
-        ic = np.array([b["c"] for b in intraday], dtype=float)
-        ih = np.array([b["h"] or b["c"] for b in intraday], dtype=float)
-        il = np.array([b["l"] or b["c"] for b in intraday], dtype=float)
-        iv = np.array([b.get("v") or 0.0 for b in intraday], dtype=float)
-        Xi, _ = build_features(ic, ih, il, iv)
-        X = np.column_stack([X, np.tile(Xi[-1], (X.shape[0], 1))])
+    # 8h 不再拼接分钟级特征块：原实现用 np.tile(Xi[-1], (n, 1)) 把最后一根
+    # 分钟特征平铺成常数列，标准化后恒为 0，对岭回归零贡献，且把未来信息
+    # 平铺到全部历史样本（前视构造）。已删除，保持 11 维特征与 walk-forward 逻辑不变。
 
     n = len(close)
     fwd = np.full(n, np.nan)
@@ -214,7 +260,12 @@ def _ridge_forecast(close: np.ndarray, high: np.ndarray, low: np.ndarray,
 # --------------------------------------------------------------------- main
 
 def forecast_one(code: str, name: str, minute_bars: list[dict],
-                 daily_bars: list[dict]) -> dict:
+                 daily_bars: list[dict], horizons=None) -> dict:
+    """多档预测。horizons 缺省为 HORIZON_DEFS（既有 /api/forecast 的六档，输出不变）；
+    传入 APP_HORIZONS 时按七档计算（/api/app/forecast 用，30m/4h 由聚合序列补算）。
+    建模逻辑与 _empty 的「数据不足 / p_up=0.5」保持一致，不伪造精度。
+    """
+    horizon_defs = horizons or HORIZON_DEFS
     out: list[dict] = []
     ind: dict = {}
 
@@ -225,8 +276,11 @@ def forecast_one(code: str, name: str, minute_bars: list[dict],
     price = float(m_close[-1]) if len(m_close) else (
         float(d_close[-1]) if len(d_close) else 0.0)
 
-    for key, label, minutes, series, step in HORIZON_DEFS:
-        base = minute_bars if series == "minute" else daily_bars
+    for key, label, minutes, series, step in horizon_defs:
+        # 前四档按真实周期把 1m 序列做时间桶聚合后再计算特征与标签；
+        # 8h/1d 仍直接用日线序列。step 语义（桶宽 / 前向回看根数）保持不变。
+        base = (_aggregate_minute_bars(minute_bars, step)
+                if series == "minute" else daily_bars)
         if len(base) < _MIN_SAMPLES + step + 10:
             out.append(_empty(key, label, minutes, price,
                               f"样本不足（{len(base)} 根）"))
@@ -256,8 +310,7 @@ def forecast_one(code: str, name: str, minute_bars: list[dict],
         candidates.append(("momentum", mom_sig, mom_hit))
 
         # ---- ridge as one more candidate
-        ridge = _ridge_forecast(close, high, low, vol, step,
-                                key == "8h", minute_bars if key == "8h" else None)
+        ridge = _ridge_forecast(close, high, low, vol, step)
         ridge_edge = 0.0
         ridge_hit = 0.5
         ridge_sigma = float(np.diff(np.log(np.maximum(close, 1e-9))).std() or 1e-6)
@@ -364,6 +417,9 @@ def forecast_one(code: str, name: str, minute_bars: list[dict],
     dirs = {"上涨": 1.0, "下跌": -1.0, "震荡": 0.0}
     acc = wsum_total = 0.0
     for h in out:
+        # 时间桶聚合后高档可能因样本不足标记为「数据不足」，不参与综合评分
+        if h["direction"] not in dirs:
+            continue
         w = max(h["confidence"], 0.05)
         acc += dirs[h["direction"]] * w
         wsum_total += w

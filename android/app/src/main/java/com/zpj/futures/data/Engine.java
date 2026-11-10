@@ -1,6 +1,7 @@
 package com.zpj.futures.data;
 
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -13,9 +14,12 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -26,6 +30,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * 手机端采集与计算引擎：定时取数 → 本地落库 → 重算预测 → 回填到期预测。
  * 完全不依赖电脑后端。
+ *
+ * <p>线程约定：Engine 在主线程构造，{@code main} Handler 绑定主线程 Looper；
+ * 所有 UI 回调都经 {@code main.post} 切回主线程。因此 {@link #start()} 可以（也确实）
+ * 在后台线程被调用——内部只有 SQLite / ScheduledExecutorService / worker 队列，
+ * 不假设当前是主线程，也不会因 Handler/Looper 报错。
  */
 public class Engine {
 
@@ -49,6 +58,9 @@ public class Engine {
     /** 支持的周期，顺序即设置页展示顺序。 */
     public static final String[] PERIODS = {"1m", "5m", "15m", "30m", "60m", "1d"};
 
+    /** 分钟周期白名单：各周期 ts 一律以 sina.minute(code, typeOf(period)) 为唯一落库口径。 */
+    private static final String[] MINUTE_PERIODS = {"1m", "5m", "15m", "30m", "60m"};
+
     private volatile long lastTick = 0;
     private volatile long lastKline = 0;
     private volatile long lastMinuteSync = 0;
@@ -61,6 +73,19 @@ public class Engine {
     private volatile ScheduledExecutorService predTimer = Executors.newSingleThreadScheduledExecutor();
     private volatile Listener listener;
     private volatile boolean started = false;
+
+    /** 完整性体检窗口：分钟线最近 7 天，日线回溯 180 天。 */
+    public static final int CHECK_DAYS = 7;
+    public static final int DAILY_DAYS = 180;
+    /** 秒级快照只能本机采集，体检只看最近 30 分钟是否还在进点。 */
+    private static final long TICK_WINDOW_MS = 30 * 60_000L;
+    /** 分批回补：每批 ≤300 根、批间 ~200ms 限速。 */
+    private static final int MAX_BATCH = 300;
+    private static final long BATCH_GAP_MS = 200L;
+    /** 失败批持久化键（与 Cfg 共用 ff_cfg 这个 SharedPreferences 文件，不新建数据库表）。 */
+    private static final String PREF_SYNC_PENDING = "sync_pending";
+
+    private final AtomicBoolean syncing = new AtomicBoolean(false);
 
     public Engine(Context ctx, Cfg cfg) {
         this.ctx = ctx.getApplicationContext();
@@ -82,7 +107,13 @@ public class Engine {
         schedule();
         scheduleForecast();
         // 首屏先出结论（用库里已有数据），随后采集线程再增量补
-        computeForecast(false);
+        if (forecastBusy.compareAndSet(false, true)) {
+            try {
+                computeForecast(false);
+            } finally {
+                forecastBusy.set(false);
+            }
+        }
         refresh(false);
         autoSyncIfEmpty();
     }
@@ -144,27 +175,36 @@ public class Engine {
         }
     }
 
+    /**
+     * 只负责调度触发，实际工作提交到 worker 队列：
+     * 不在 predTimer 线程里直接调用带网络/sleep 的方法，避免持锁阻塞调度器。
+     */
     private void tickForecast() {
         if (!forecastBusy.compareAndSet(false, true)) return;
         long now = System.currentTimeMillis();
-        boolean wholeHour = (now / 60_000) % 60 == 0;
+        final boolean wholeHour = (now / 60_000) % 60 == 0;
         nextForecastAt = now + 60_000;
         try {
-            if (wholeHour) {
-                // 整点加强：先把数据补到最新，再跑全七档
-                incrementalMinute(true);
-                incrementalDaily(true);
-                refreshLongPeriodsIfStale();
-                computeForecast(true);
-            } else {
-                computeForecast(false);
-            }
-            verifyDue();
+            worker.execute(() -> {
+                try {
+                    if (wholeHour) {
+                        incrementalMinute(true);
+                        incrementalDaily(true);
+                        refreshLongPeriodsIfStale();
+                        computeForecast(true);
+                    } else {
+                        computeForecast(false);
+                    }
+                    verifyDue();
+                } catch (Exception e) {
+                    lastError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+                } finally {
+                    forecastBusy.set(false);
+                    if (listener != null) main.post(listener::onUpdate);
+                }
+            });
         } catch (Exception e) {
-            lastError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
-        } finally {
-            forecastBusy.set(false);
-            if (listener != null) main.post(listener::onUpdate);
+            forecastBusy.set(false);   // 线程池已关闭时释放锁，避免永久卡住
         }
     }
 
@@ -221,7 +261,7 @@ public class Engine {
         }
         if (!q.isEmpty()) lastTick = System.currentTimeMillis();
 
-        // 2) 分钟线增量：每 60 秒一次，只补「本地最后一根及之后」
+        // 2) 分钟线增量：每周期 60 秒一次，只补「本地最后一根及之后」
         incrementalMinute(full);
         // 3) 日线增量：每 30 分钟一次
         incrementalDaily(full);
@@ -235,59 +275,63 @@ public class Engine {
         store.prune(30);
 
         // 7) 预测不在这里重算：整分钟对齐由 scheduleForecast() 负责；
-        //    只有还没有任何结论时（首启 / 换品种）补一次，避免首屏空白
-        if (forecasts.isEmpty()) computeForecast(false);
+        //    只有还没有任何结论时（首启 / 换品种）补一次，且用 forecastBusy 串行化，
+        //    避免自动 short 重算覆盖手动全量结果。
+        if (forecasts.isEmpty() && forecastBusy.compareAndSet(false, true)) {
+            try {
+                computeForecast(false);
+            } finally {
+                forecastBusy.set(false);
+            }
+        }
     }
 
     /**
-     * 1 分钟线增量：只把「本地最后一根及之后」的 bar 写库，
-     * 并用本次拿到的 1m 序列按时间桶聚合，增量补 5/15/30/60 分钟。
+     * 分钟线增量（统一口径）：1m/5m/15m/30m/60m 各自直接取源站
+     * {@code sina.minute(code, typeOf(period))} 返回的 ts 作为唯一落库口径，
+     * 不再把 1m 派生的聚合结果写进 kline（避免与源站段末时间戳形成双套口径）。
+     * 4h/8h 仅内存基于 60m 聚合用于预测，不落库。
      *
      * @param force true 时忽略 60 秒节流（整点加强 / 手动刷新）
-     * @return 实际写入的根数（含本地聚合产物）
+     * @return 实际写入的根数
      */
-    public synchronized int incrementalMinute(boolean force) {
+    public int incrementalMinute(boolean force) {
         long now = System.currentTimeMillis();
         if (!force && now - lastMinuteSync < 60_000L) return 0;
         lastMinuteSync = now;
         int added = 0;
+        outer:
         for (String code : Products.CODES) {
-            List<Bar> m;
-            try {
-                m = sina.minute(code, 1);
-            } catch (Exception e) {
-                continue;
-            }
-            if (m.isEmpty()) continue;
-            long localMax = store.lastKlineTs(code, "1m");
-            List<Bar> fresh = tail(m, localMax);
-            if (!fresh.isEmpty()) {
-                store.upsertKlines(code, "1m", fresh);
-                mergeCache(code, "1m", fresh);
-                added += fresh.size();
-            }
-            // 伦铝源站只给当日分时，聚合长周期没有意义，保持「1m + 日线」
-            if ("AHD".equals(code)) continue;
-            for (String period : new String[]{"5m", "15m", "30m", "60m"}) {
-                List<Bar> agg = Forecaster.aggregateByTime(m, stepMinutes(period));
-                if (agg.isEmpty()) continue;
-                List<Bar> add = tail(agg, store.lastKlineTs(code, period));
-                if (add.isEmpty()) continue;
-                store.upsertKlines(code, period, add);
-                mergeCache(code, period, add);
-                added += add.size();
-            }
-            try {
-                Thread.sleep(120);
-            } catch (InterruptedException ignored) {
+            for (String period : minutePeriodsOf(code)) {
+                List<Bar> m;
+                try {
+                    m = sina.minute(code, SinaClient.typeOf(period));
+                } catch (Exception e) {
+                    continue;
+                }
+                if (m.isEmpty()) continue;
+                long localMax = store.lastKlineTs(code, period);
+                List<Bar> fresh = tail(m, localMax);
+                if (!fresh.isEmpty()) {
+                    store.upsertKlines(code, period, fresh);
+                    mergeCache(code, period, fresh);
+                    added += fresh.size();
+                }
+                // 被中断 → 恢复中断标志并退出，让 shutdownNow 生效
+                if (!sleepMs(120)) break outer;
             }
         }
         if (added > 0) lastKline = now;
         return added;
     }
 
+    /** 各品种要采集的分钟周期；伦铝源站只有当日 1 分钟分时，无独立 5m 及以上序列。 */
+    private static String[] minutePeriodsOf(String code) {
+        return "AHD".equals(code) ? new String[]{"1m"} : MINUTE_PERIODS;
+    }
+
     /** 日线增量：每 30 分钟一次，只写本地最后一根及之后。 */
-    public synchronized int incrementalDaily(boolean force) {
+    public int incrementalDaily(boolean force) {
         long now = System.currentTimeMillis();
         if (!force && now - lastDailySync < 30 * 60_000L) return 0;
         lastDailySync = now;
@@ -302,9 +346,9 @@ public class Engine {
                     mergeCache(code, "1d", add);
                     added += add.size();
                 }
-                Thread.sleep(160);
             } catch (Exception ignored) {
             }
+            if (!sleepMs(160)) break;
         }
         return added;
     }
@@ -332,26 +376,8 @@ public class Engine {
         klineCache.put(key, merged);
     }
 
-    private static int stepMinutes(String period) {
-        switch (period) {
-            case "60m":
-                return 60;
-            case "30m":
-                return 30;
-            case "15m":
-                return 15;
-            case "5m":
-                return 5;
-            default:
-                return 1;
-        }
-    }
-
-    /**
-     * 重算预测。full=true 跑全部七档；false 只重算 ≤30 分钟的四档
-     * （4h/8h/1d 沿用上一次结果，整点加强时才全部重算）。
-     */
-    public synchronized JSONObject computeForecast(boolean full) {
+    /** 重算预测。调用方需以 forecastBusy 串行化，避免自动 short 覆盖手动全量结果。 */
+    public JSONObject computeForecast(boolean full) {
         for (String code : Products.CODES) {
             JSONObject prev = forecasts.get(code);
             JSONObject f = Forecaster.forecast(code, bars(code, "1m"),
@@ -363,7 +389,7 @@ public class Engine {
         return forecasts.get(Products.CODES[0]);
     }
 
-    /** 手动刷新预测：先把数据增量补到最新，再跑全七档。后台线程调用。 */
+    /** 手动刷新预测：先把数据增量补到最新，再跑全七档并回填到期记录。后台线程调用。 */
     public JSONObject forceForecast(SyncListener cb) {
         JSONObject res = new JSONObject();
         if (!forecastBusy.compareAndSet(false, true)) {
@@ -375,7 +401,7 @@ public class Engine {
             return res;
         }
         try {
-            if (cb != null) cb.onStep("补齐最近行情（1 分钟线 + 日线）…", 0, 3);
+            if (cb != null) cb.onStep("补齐最近行情（分钟线 + 日线）…", 0, 3);
             int addMin = incrementalMinute(true);
             int addDay = incrementalDaily(true);
             refreshLongPeriodsIfStale();
@@ -416,7 +442,7 @@ public class Engine {
         return forecastBusy.get();
     }
 
-    /** 60 分钟线超过 3 小时未更新时补拉一次（只拉 60m，流量可控）。 */
+    /** 60 分钟线超过 3 小时未更新时补拉一次（直接取源站 60m，口径统一、流量可控）。 */
     private void refreshLongPeriodsIfStale() {
         long now = System.currentTimeMillis();
         for (String code : Products.CODES) {
@@ -428,49 +454,48 @@ public class Engine {
                     store.upsertKlines(code, "60m", bars);
                     klineCache.put(code + "|60m", store.klines(code, "60m", 1600));
                 }
-                Thread.sleep(220);
             } catch (Exception ignored) {
             }
+            if (!sleepMs(220)) break;
         }
     }
 
     public interface SyncListener {
         /**
          * @param message 当前步骤文案
-         * @param done    已完成的「品种 × 周期」步数（从 0 开始）
-         * @param total   总步数
+         * @param done    已完成的步数（从 0 开始）
+         * @param total   总步数；<=0 表示不确定态
          */
         void onStep(String message, int done, int total);
     }
 
-    private final AtomicBoolean syncing = new AtomicBoolean(false);
-
     public boolean isSyncing() {
         return syncing.get();
     }
-
-    /** 完整性体检窗口：最近 7 天。 */
-    public static final int CHECK_DAYS = 7;
-
-    /** 秒级快照只能本机采集，体检只看最近 30 分钟是否还在进点。 */
-    private static final long TICK_WINDOW_MS = 30 * 60_000L;
 
     public JSONObject syncHistory(SyncListener cb) {
         return syncHistory(cb, false);
     }
 
     /**
-     * 同步历史数据：**体检 → 补齐 → 增量** 三段（v2.4.0）。
+     * 同步历史数据：**体检 → 构建分批 → 分批回补（失败批续跑）**（v2.4.0+）。
      *
-     * <p>体检把源站返回的序列当基准，逐根比对本地时间戳：源站有、本地没有 = 缺失；
-     * 本地该周期近 7 天一根都没有而源站有 = 被清空。有缺失/清空就把该周期窗口内的 bar
-     * 整体 REPLACE 写回（可回补历史空洞），没有缺失才走原来的 tail 增量。
-     * 以源站序列为基准可以完全避开自建交易日历，夜盘、周末、节假日都不会误判。
+     * <p>体检把源站返回的序列当基准逐根比对本地时间戳：源站有、本地没有 = 缺失。
+     * 日线体检基准为 {@link #DAILY_DAYS} 天，分钟线为 {@link #CHECK_DAYS} 天；
+     * 窗口为空的周期不参与回补。
      *
-     * <p>源站单周期上限 1023 根（1m≈2 个交易日、5m≈9 天、15m≈27 天），
-     * 因此 7 天的 1m 空洞可能补不全，返回值里如实给出「实际覆盖起点」。
+     * <p>回补把「待写入的缺失 bar」按「品种×周期」顺序切成每批 ≤{@link #MAX_BATCH} 根，
+     * 批间限速 ~200ms，逐批写回且**只写源站有而本地缺的那些 ts**（不整窗 REPLACE，
+     * 避免覆盖本地更及时的数据）。单批失败只记录该批并继续，失败批持久化到
+     * Cfg（ff_cfg / sync_pending）供下次同步只重试失败批；全部成功则清空。
+     * 重复同步幂等：无缺失时零新增。
      *
-     * @param forceFull true 时忽略缺失判定，把近 7 天窗口整体重写（数据错乱时手动使用）
+     * <p>分钟各周期 ts 以源站段末为唯一口径（见 {@link #incrementalMinute(boolean)}）；
+     * 1m 源站上限 1023 根、仅覆盖约 2 交易日，7 天前不补、不插值、不伪造，
+     * coverage 逐周期给真实起点。
+     *
+     * @param forceFull true 仅作「强制体检」标记，不改变「只补缺」的写入口径
+     *                  （不会退化成整段重写 180 天日线）
      */
     public JSONObject syncHistory(SyncListener cb, boolean forceFull) {
         JSONObject res = new JSONObject();
@@ -483,25 +508,24 @@ public class Engine {
             return res;
         }
         long now = System.currentTimeMillis();
-        long dailyCut = now - 180L * 86400_000L;
+        long dailyCut = now - DAILY_DAYS * 86400_000L;
         long checkCut = now - CHECK_DAYS * 86400_000L;
         List<Job> jobs = new ArrayList<>();
         for (String code : Products.CODES) {
             for (String period : periodsOf(code)) jobs.add(new Job(code, period));
         }
-        int totalSteps = jobs.size() * 2 + 2;
-        int step = 0;
-        int added = 0, scanned = 0, missing = 0, gaps = 0, cleared = 0;
-        int healedItems = 0, healedBars = 0;
+
+        int scanned = 0, missing = 0, gaps = 0, cleared = 0;
+        int wroteBars = 0, healedItems = 0;
         StringBuilder fail = new StringBuilder();
         JSONObject detail = new JSONObject();
         JSONObject coverage = new JSONObject();
+        List<Batch> failedBatches = new ArrayList<>();
         try {
-            // ---------- 第 1 段：体检（拉一次源站数据并缓存，写入阶段复用） ----------
+            // ---------- 阶段 1：体检（拉源站数据并逐根比对，进度用不确定态） ----------
             for (Job j : jobs) {
                 if (cb != null) {
-                    cb.onStep("体检 " + Products.nameOf(j.code) + " " + labelOf(j.period) + "…",
-                            step, totalSteps);
+                    cb.onStep("体检 " + Products.nameOf(j.code) + " " + labelOf(j.period) + "…", 0, 0);
                 }
                 try {
                     j.bars = "1d".equals(j.period)
@@ -509,57 +533,85 @@ public class Engine {
                             : sina.minute(j.code, SinaClient.typeOf(j.period));
                 } catch (Exception e) {
                     j.error = brief(e);
+                    fail.append(Products.nameOf(j.code)).append(labelOf(j.period))
+                            .append("[").append(brief(e)).append("] ");
                 }
                 if (j.bars == null) j.bars = new ArrayList<>();
                 if (!j.bars.isEmpty()) {
-                    analyze(j, checkCut);
+                    analyze(j, "1d".equals(j.period) ? dailyCut : checkCut);
                     scanned++;
                     missing += j.missing;
                     gaps += j.gaps;
                     if (j.cleared) cleared++;
                 }
-                step++;
-                Thread.sleep("1d".equals(j.period) ? 160 : 220);
+                if (!sleepMs("1d".equals(j.period) ? 160 : 220)) break;
             }
             if (cb != null) {
                 cb.onStep("体检完成 · 扫描 " + scanned + " 组 · 缺失 " + missing + " 根 / "
-                        + gaps + " 段" + (cleared > 0 ? " · 清空 " + cleared + " 组" : ""),
-                        step, totalSteps);
+                        + gaps + " 段" + (cleared > 0 ? " · 清空 " + cleared + " 组" : ""), 0, 0);
             }
-            step++;
 
-            // ---------- 第 2 段：补齐（有缺口）或增量（无缺口） ----------
-            for (Job j : jobs) {
-                String name = Products.nameOf(j.code);
-                boolean heal = forceFull || j.missing > 0 || j.cleared;
+            // ---------- 阶段 2：分批回补（含上次失败批续跑），只写源站有而本地缺的 ts ----------
+            List<Batch> pending = loadPending();
+            List<Batch> batches = buildBatches(jobs, pending);
+            int totalSteps = Math.max(1, batches.size()) + 1;   // 批次 + 收尾
+            int step = 0;
+            Map<String, Integer> wrotePerKey = new LinkedHashMap<>();
+            for (int i = 0; i < batches.size(); i++) {
+                Batch b = batches.get(i);
+                String name = Products.nameOf(b.code);
                 if (cb != null) {
-                    cb.onStep((heal ? "补齐 " : "增量 ") + name + " " + labelOf(j.period)
-                            + (j.missing > 0 ? "（缺 " + j.missing + " 根）" : "") + "…",
+                    cb.onStep("第 " + (i + 1) + "/" + batches.size() + " 批 · 补 "
+                            + b.bars.size() + " 根 " + name + labelOf(b.period) + "…",
                             step, totalSteps);
                 }
-                JSONObject r = apply(j, forceFull);
+                try {
+                    store.upsertKlines(b.code, b.period, b.bars);
+                    wroteBars += b.bars.size();
+                    String k = b.code + "|" + b.period;
+                    wrotePerKey.put(k, wrotePerKey.getOrDefault(k, 0) + b.bars.size());
+                } catch (Exception e) {
+                    // 单批失败只记录该批并继续其它批
+                    failedBatches.add(b);
+                    fail.append(name).append(labelOf(b.period))
+                            .append("[写入失败:").append(brief(e)).append("] ");
+                }
+                step++;
+                if (!sleepMs(BATCH_GAP_MS)) {
+                    // 被中断：剩余未写入的批次也记为待续跑
+                    for (int k = i + 1; k < batches.size(); k++) failedBatches.add(batches.get(k));
+                    break;
+                }
+            }
+            // 失败批写回 Cfg（ff_cfg / sync_pending）；全部成功则清空
+            savePending(failedBatches);
+
+            // detail：每 品种×周期 的实际写入根数（written/added 均为实际写入，不是 missing）
+            for (Job j : jobs) {
+                String k = j.code + "|" + j.period;
+                int w = wrotePerKey.getOrDefault(k, 0);
                 JSONObject one = detail.optJSONObject(j.code);
                 if (one == null) {
                     one = new JSONObject();
                     detail.put(j.code, one);
                 }
+                JSONObject r = new JSONObject();
+                r.put("added", w);
+                r.put("written", w);
+                r.put("fetched", j.bars.size());
+                r.put("local_window", j.localWindow);
+                r.put("tail", j.tail);
+                r.put("missing", j.missing);
+                r.put("gaps", j.gaps);
+                r.put("cleared", j.cleared);
+                r.put("healed", w > 0);
                 one.put(j.period, r);
-                added += r.optInt("added", 0);
-                if (r.optBoolean("healed", false)) {
-                    healedItems++;
-                    healedBars += j.missing;
-                }
-                long cov = store.firstKlineTsSince(j.code, j.period, checkCut);
-                coverage.put(j.code + "|" + j.period, cov);
-                if (r.has("error")) {
-                    fail.append(name).append(labelOf(j.period))
-                            .append("[").append(r.optString("error")).append("] ");
-                }
-                step++;
-                Thread.sleep("1d".equals(j.period) ? 160 : 200);
+                if (w > 0) healedItems++;
+                // 逐周期真实起点（全库最早一根）
+                coverage.put(k, store.firstKlineTsSince(j.code, j.period, 0L));
             }
 
-            // ---------- 第 3 段：秒级校验 + 刷新缓存 + 统计 ----------
+            // ---------- 阶段 3：秒级校验 + 刷新缓存 + 统计 ----------
             if (cb != null) cb.onStep("校验秒级快照 · 刷新本地缓存…", totalSteps, totalSteps);
             JSONObject ticks = checkTicks();
             reloadCaches();
@@ -568,34 +620,40 @@ public class Engine {
             JSONObject periods = store.periodStats();
             JSONObject check = new JSONObject();
             check.put("days", CHECK_DAYS);
+            check.put("daily_days", DAILY_DAYS);
             check.put("scanned", scanned);
             check.put("missing", missing);
             check.put("gaps", gaps);
             check.put("cleared", cleared);
             check.put("healed_items", healedItems);
-            check.put("healed_bars", healedBars);
+            check.put("healed_bars", wroteBars);        // 实际写入根数
+            check.put("batches", batches.size());
+            check.put("failed_batches", failedBatches.size());
+            check.put("pending_retried", pending.size());
             check.put("forced", forceFull);
-            check.put("incremental", added);
+            check.put("incremental", wroteBars);
 
-            String base = summary(periods, now, added);
+            String base = summary(periods, now, wroteBars);
             String head;
-            if (forceFull) head = "强制全量重写近 " + CHECK_DAYS + " 天 · ";
+            if (forceFull) head = "强制体检（仅补缺，不整段重写）· ";
             else if (missing > 0 || cleared > 0) {
-                head = "体检回补 " + healedBars + " 根 / " + healedItems + " 组 · ";
+                head = "体检回补 " + wroteBars + " 根 / " + healedItems + " 组 · ";
             } else head = "体检无缺失 · ";
             String msg = head + base;
 
             long cov1m = minCoverage(coverage, "|1m");
-            String note = "秒级仅本机采集（最近 30 分钟 " + ticks.optInt("points", 0)
+            String note = "分钟线近 " + CHECK_DAYS + " 天、日线回溯 " + DAILY_DAYS
+                    + " 天体检并增量同步；各分钟周期以源站段末 ts 为唯一落库口径"
+                    + "；1m 源站上限 1023 根，仅覆盖约 2 交易日（7 天前不补、不插值、不伪造）"
+                    + "；5m/15m/30m/60m 近 7 天窗口可补满"
+                    + "；秒级仅本机采集（最近 30 分钟 " + ticks.optInt("points", 0)
                     + " 点），公开源不提供历史秒级，无法回溯补齐";
-            if (cov1m > 0) {
-                note += "；1 分钟线实际覆盖起点 " + dayStr(cov1m) + "（受源站 1023 根上限）";
-            }
+            if (cov1m > 0) note += "；1 分钟线实际覆盖起点 " + dayStr(cov1m);
 
             res.put("ok", true);
-            res.put("fetched", added);
-            res.put("added", added);
-            res.put("healed_bars", healedBars);
+            res.put("fetched", wroteBars);
+            res.put("added", wroteBars);
+            res.put("healed_bars", wroteBars);
             res.put("healed_items", healedItems);
             res.put("periods", periods);
             res.put("detail", detail);
@@ -606,7 +664,7 @@ public class Engine {
             res.put("message", msg);
             cfg.setLastSyncMsg(msg);
             if (fail.length() > 0) {
-                String warn = "部分数据未取到：" + trimTo(fail.toString(), 220);
+                String warn = "部分数据未取到（失败批已记入下次续跑）：" + trimTo(fail.toString(), 220);
                 res.put("warn", warn);
                 cfg.setLastSyncMsg(msg + "｜" + warn);
             }
@@ -628,13 +686,14 @@ public class Engine {
     private static final class Job {
         final String code;
         final String period;
-        List<Bar> bars = new ArrayList<>();   // 源站返回的全部 bar
-        List<Bar> window = new ArrayList<>(); // 落在最近 7 天内的 bar
-        int localWindow;                      // 本地近 7 天根数
-        int missing;                          // 空洞根数（不含正常尾部新增）
-        int gaps;                             // 空洞连成几段
-        int tail;                             // 本地最后一根之后的新 bar（正常增量）
-        boolean cleared;                      // 本地近 7 天为 0 而源站有数据
+        List<Bar> bars = new ArrayList<>();      // 源站返回的全部 bar
+        List<Bar> window = new ArrayList<>();    // 落在该周期体检窗口内的 bar
+        Set<Long> localTs = new HashSet<>();     // 窗口内本地已有的 ts（体检复用）
+        int localWindow;
+        int missing;
+        int gaps;
+        int tail;
+        boolean cleared;
         String error;
 
         Job(String code, String period) {
@@ -643,29 +702,40 @@ public class Engine {
         }
     }
 
+    /** 一批待写入的 bar（≤MAX_BATCH 根），带品种与周期。 */
+    private static final class Batch {
+        final String code;
+        final String period;
+        final List<Bar> bars;
+
+        Batch(String code, String period, List<Bar> bars) {
+            this.code = code;
+            this.period = period;
+            this.bars = bars;
+        }
+    }
+
     /** 逐根比对源站与本地，算出「空洞」数（不含正常尾部新增）、缺口段数、是否整段被清空。 */
-    private void analyze(Job j, long checkCut) {
+    private void analyze(Job j, long cut) {
         j.window = new ArrayList<>();
-        for (Bar b : j.bars) if (b.ts >= checkCut) j.window.add(b);
-        Set<Long> local = store.klineTsSet(j.code, j.period, checkCut);
-        j.localWindow = local.size();
+        for (Bar b : j.bars) if (b.ts >= cut) j.window.add(b);
+        j.localTs = store.klineTsSet(j.code, j.period, cut);
+        j.localWindow = j.localTs.size();
         j.cleared = j.localWindow == 0 && !j.window.isEmpty();
         if (j.cleared) {
-            // 整段没了：全部按缺失算，一次整体写回
             j.missing = j.window.size();
             j.gaps = 1;
             j.tail = 0;
             return;
         }
         long localMax = 0;
-        for (Long t : local) if (t > localMax) localMax = t;
+        for (Long t : j.localTs) if (t > localMax) localMax = t;
         boolean inGap = false;
         for (Bar b : j.window) {
-            if (local.contains(b.ts)) {
+            if (j.localTs.contains(b.ts)) {
                 inGap = false;
             } else if (localMax > 0 && b.ts > localMax) {
-                // 本地最后一根之后的新 bar：正常增量，不算缺口
-                j.tail++;
+                j.tail++;      // 本地最后一根之后的新 bar：正常增量，不算缺口
             } else {
                 j.missing++;
                 if (!inGap) {
@@ -676,37 +746,112 @@ public class Engine {
         }
     }
 
-    /** 有空洞/清空就把近 7 天窗口整体 REPLACE 写回；只有尾部新增时按增量写。 */
-    private JSONObject apply(Job j, boolean forceFull) {
-        JSONObject r = new JSONObject();
-        try {
-            int before = store.countKline(j.code, j.period);
-            long localMax = store.lastKlineTs(j.code, j.period);
-            boolean heal = forceFull || j.missing > 0 || j.cleared;
-            List<Bar> write;
-            if (heal) write = j.window.isEmpty() ? j.bars : j.window;
-            else write = tail(j.bars, localMax);
-            if (!write.isEmpty()) store.upsertKlines(j.code, j.period, write);
-            int after = store.countKline(j.code, j.period);
-            r.put("added", Math.max(0, after - before));
-            r.put("total", after);
-            r.put("fetched", j.bars.size());
-            r.put("written", write.size());
-            r.put("local_window", j.localWindow);
-            r.put("tail", j.tail);
-            r.put("missing", j.missing);
-            r.put("gaps", j.gaps);
-            r.put("cleared", j.cleared);
-            r.put("healed", heal);
-            if (after <= 0) r.put("error", "返回 0 根");
-        } catch (Exception e) {
-            try {
-                r.put("added", 0);
-                r.put("error", brief(e));
-            } catch (Exception ignored) {
+    /**
+     * 构建回补批次：把「上次失败批」与「本次各周期窗口内源站 bars」按 (code,period,ts)
+     * 去重汇总，再过滤出「本地确实没有」的 ts，最后按 品种×周期 顺序切成 ≤MAX_BATCH 的批次。
+     * 只写本地缺的 ts，不整窗 REPLACE。
+     */
+    private List<Batch> buildBatches(List<Job> jobs, List<Batch> pending) {
+        Map<String, TreeMap<Long, Bar>> byKey = new LinkedHashMap<>();
+        for (Job j : jobs) byKey.put(j.code + "|" + j.period, new TreeMap<>());
+        // 1) 上次失败批优先并入（续跑）
+        for (Batch b : pending) {
+            TreeMap<Long, Bar> t = byKey.get(b.code + "|" + b.period);
+            if (t == null) continue;
+            for (Bar bar : b.bars) if (bar.ts > 0) t.put(bar.ts, bar);
+        }
+        // 2) 本次窗口内源站 bars（窗口为空的周期不 heal）
+        for (Job j : jobs) {
+            if (j.window == null || j.window.isEmpty()) continue;
+            TreeMap<Long, Bar> t = byKey.get(j.code + "|" + j.period);
+            for (Bar bar : j.window) if (bar.ts > 0) t.put(bar.ts, bar);
+        }
+        List<Batch> out = new ArrayList<>();
+        for (Job j : jobs) {
+            TreeMap<Long, Bar> t = byKey.get(j.code + "|" + j.period);
+            if (t == null || t.isEmpty()) continue;
+            // 用全库 ts 集合判定「本地是否已有该 ts」，避免窗口外 ts 被误判为缺失
+            Set<Long> local = store.klineTsSet(j.code, j.period, 0L);
+            List<Bar> need = new ArrayList<>();
+            for (Map.Entry<Long, Bar> e : t.entrySet()) {
+                if (!local.contains(e.getKey())) need.add(e.getValue());
+            }
+            for (int i = 0; i < need.size(); i += MAX_BATCH) {
+                int end = Math.min(i + MAX_BATCH, need.size());
+                out.add(new Batch(j.code, j.period, new ArrayList<>(need.subList(i, end))));
             }
         }
-        return r;
+        return out;
+    }
+
+    /** 读取 Cfg（ff_cfg / sync_pending）里的失败批；损坏则清空并返回空。 */
+    private List<Batch> loadPending() {
+        List<Batch> out = new ArrayList<>();
+        try {
+            SharedPreferences sp = ctx.getSharedPreferences("ff_cfg", Context.MODE_PRIVATE);
+            String raw = sp.getString(PREF_SYNC_PENDING, "");
+            if (raw == null || raw.isEmpty()) return out;
+            JSONObject root = new JSONObject(raw);
+            JSONArray arr = root.optJSONArray("batches");
+            if (arr == null) return out;
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject b = arr.optJSONObject(i);
+                if (b == null) continue;
+                String code = b.optString("code", "");
+                String period = b.optString("period", "");
+                if (code.isEmpty() || period.isEmpty()) continue;
+                JSONArray rows = b.optJSONArray("bars");
+                if (rows == null) continue;
+                List<Bar> bars = new ArrayList<>();
+                for (int k = 0; k < rows.length(); k++) {
+                    JSONArray r = rows.optJSONArray(k);
+                    if (r == null || r.length() < 6) continue;
+                    bars.add(new Bar(r.optLong(0), r.optDouble(1), r.optDouble(2),
+                            r.optDouble(3), r.optDouble(4), r.optDouble(5)));
+                }
+                if (!bars.isEmpty()) out.add(new Batch(code, period, bars));
+            }
+        } catch (Exception e) {
+            savePending(new ArrayList<Batch>());
+            return new ArrayList<>();
+        }
+        return out;
+    }
+
+    /** 失败批写回 Cfg（ff_cfg / sync_pending）；空则清空。不新建数据库表。 */
+    private void savePending(List<Batch> batches) {
+        SharedPreferences sp = ctx.getSharedPreferences("ff_cfg", Context.MODE_PRIVATE);
+        if (batches == null || batches.isEmpty()) {
+            sp.edit().remove(PREF_SYNC_PENDING).apply();
+            return;
+        }
+        try {
+            JSONArray arr = new JSONArray();
+            for (Batch b : batches) {
+                JSONObject ob = new JSONObject();
+                ob.put("code", b.code);
+                ob.put("period", b.period);
+                JSONArray rows = new JSONArray();
+                for (Bar bar : b.bars) {
+                    JSONArray r = new JSONArray();
+                    r.put(bar.ts);
+                    r.put(bar.o);
+                    r.put(bar.h);
+                    r.put(bar.l);
+                    r.put(bar.c);
+                    r.put(bar.v);
+                    rows.put(r);
+                }
+                ob.put("bars", rows);
+                arr.put(ob);
+            }
+            JSONObject root = new JSONObject();
+            root.put("v", 1);
+            root.put("ts", System.currentTimeMillis());
+            root.put("batches", arr);
+            sp.edit().putString(PREF_SYNC_PENDING, root.toString()).apply();
+        } catch (Exception ignored) {
+        }
     }
 
     /** 秒级体检：统计最近 30 分钟点数；最新点太旧就立刻补一次实时报价。 */
@@ -799,7 +944,7 @@ public class Engine {
     private static String brief(Exception e) {
         String m = e.getMessage();
         if (m == null || m.trim().isEmpty()) m = e.getClass().getSimpleName();
-        return trimTo(m, 60);
+        return Cfg.redact(trimTo(m, 60));
     }
 
     private static String trimTo(String s, int n) {
@@ -825,6 +970,17 @@ public class Engine {
         }
         if (first) sb.append("暂无数据（网络不可用？）");
         return sb.toString();
+    }
+
+    /** 睡眠；被中断时恢复中断标志并返回 false，让 shutdownNow 生效。 */
+    private static boolean sleepMs(long ms) {
+        try {
+            Thread.sleep(ms);
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     /** 每个品种每个周期 10 分钟内只留一条，避免预测表被刷爆。 */
@@ -918,7 +1074,16 @@ public class Engine {
             o.put("kline_rows", store.countKlineAll());
             o.put("syncing", syncing.get());
             o.put("stats", store.stats());
-            o.put("horizons", new JSONArray());
+            // 顶层 horizons 填真实 7 档（前端只读 p.forecast.horizons，这里保证字段不缺失/不误导）
+            JSONArray hs = new JSONArray();
+            for (String[] h : Forecaster.HORIZONS) {
+                JSONObject x = new JSONObject();
+                x.put("key", h[0]);
+                x.put("label", h[1]);
+                x.put("minutes", Integer.parseInt(h[2]));
+                hs.put(x);
+            }
+            o.put("horizons", hs);
         } catch (Exception ignored) {
         }
         return o;
@@ -926,26 +1091,27 @@ public class Engine {
 
     /** 采样成前端画图用的点（控制体积）。 */
     public JSONArray sparkline(String code, int points) {
+        int p = Math.max(1, Math.min(600, points));
         JSONArray arr = new JSONArray();
         try {
-            List<double[]> t = store.recentTicks(code, points * 4);
+            List<double[]> t = store.recentTicks(code, p * 4);
             if (t.isEmpty()) {
                 List<Bar> bars = bars(code, "1m");
-                int from = Math.max(0, bars.size() - points);
+                int from = Math.max(0, bars.size() - p);
                 for (int i = from; i < bars.size(); i++) {
-                    JSONArray p = new JSONArray();
-                    p.put(bars.get(i).ts);
-                    p.put(bars.get(i).c);
-                    arr.put(p);
+                    JSONArray pt = new JSONArray();
+                    pt.put(bars.get(i).ts);
+                    pt.put(bars.get(i).c);
+                    arr.put(pt);
                 }
                 return arr;
             }
-            int step = Math.max(1, t.size() / points);
+            int step = Math.max(1, t.size() / p);
             for (int i = 0; i < t.size(); i += step) {
-                JSONArray p = new JSONArray();
-                p.put((long) t.get(i)[0]);
-                p.put(t.get(i)[1]);
-                arr.put(p);
+                JSONArray pt = new JSONArray();
+                pt.put((long) t.get(i)[0]);
+                pt.put(t.get(i)[1]);
+                arr.put(pt);
             }
         } catch (Exception ignored) {
         }

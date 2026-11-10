@@ -150,7 +150,8 @@ public class SeedImporter {
             int before = store.countKlineAll();
             int total = 0;
             Cursor c = seed.rawQuery(
-                    "SELECT code,period,ts,o,h,l,c,v FROM seed.kline", null);
+                    // 只读句柄直接打开 seed.db，未 ATTACH，故用默认库 kline（非 seed.kline）
+                    "SELECT code,period,ts,o,h,l,c,v FROM kline", null);
             List<ContentValues> batch = new ArrayList<>(800);
             db.beginTransaction();
             try {

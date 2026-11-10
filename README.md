@@ -58,9 +58,9 @@ bash run.sh
 
 每个 (品种 × 周期) 独立训练：
 
-1. **特征**：标准化收益率、EMA 比值、RSI、MACD 柱、布林 Z 值、ATR 占比、20 期波动率、量比、时间趋势项；8 小时周期额外拼接分钟级特征块。
+1. **特征**：标准化收益率、EMA 比值、RSI、MACD 柱、布林 Z 值、ATR 占比、20 期波动率、量比、时间趋势项；8 小时周期不再拼接分钟级特征块（与 1 天同样仅用日线序列）。
 2. **目标**：未来 N 根的**对数收益率**，1% 分位缩尾去极值。
-3. **验证**：前 70% 训练、后 30% 走向外验证，报告真实样本外方向胜率。
+3. **验证**：前 70% 训练、后 30% 走向外验证（`_FOLD_FRACTION = 0.30`），报告真实样本外方向胜率。
 4. **融合**：岭回归权重与其验证胜率挂钩（胜率 ≤50% 时权重为 0），剩余权重给动量持续性；若两个信号都没有验证优势，自动收缩输出并报“震荡”，避免用掷硬币的准确率给出自信的错误结论。
 5. **概率**：用验证残差标准差把融合信号映射为正态 CDF，得到上涨概率。
 6. **综合**：六周期按置信度加权投票得到看涨 / 中性 / 看跌，并生成带风险提示的建议文本。
@@ -261,17 +261,55 @@ bash android/build-apk.sh
 
 ```json
 {
-  "version": "2.4.0",
-  "versionCode": 240,
+  "version": "2.5.0",
+  "versionCode": 250,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "notes": "…"
 }
 ```
 
 发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName`
-→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.4.0`）
-→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 240`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
+→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.5.0`）
+→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 250`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
 
-## 九、免责声明
+## 九、v2.5.0：审查修复 · 服务端对照 · 分批补全
+
+### 为什么要发这一版
+
+对全仓做三路并行只读审查（静态代码 / 业务逻辑 / 安全审计），共定位 8 项严重、28 项中等与若干建议级问题；
+按确认口径把严重＋中等全部修复，并合并两项新需求：**服务端对照 App 全对齐**、**分钟级数据分批补全**。
+完整问题清单、修复状态、App↔backend 差异表与残余风险见 `docs/10_代码审查与差异报告.md`。
+
+### 主要变化
+
+| 模块 | 变化 |
+|---|---|
+| 更新与安全 | 下载地址不再由前端传入（native 用 `check()` 缓存）、https + `gitee.com/*.gitee.com` 白名单逐跳校验、安装前校验 APK 包名/versionCode/签名证书、未授权安装走 `need_permission` + 「继续安装」、错误统一脱敏 |
+| WebView / 凭据 | 导航白名单只放行 `file:///android_asset/`、关闭跨域文件访问与混合内容；Gitee 令牌只对白名单 URL 附加；`llm_base` 强制 https 且禁内网；加密失败不再明文落盘、`allowBackup=false`；HTTPS 不再降级明文（仅 127.0.0.1/localhost 对照服务例外） |
+| 同步与预测 | 各周期统一源站 ts 口径（此前源站「段末」与本地「自然桶起点」双轨导致永远补不齐）；回补按品种×周期每批 ≤300 根自动连续、失败批存 `sync_pending` 下次续跑、幂等；日线体检改 180 天、只写真正缺失的 ts；sigma 归一化修复、伦铝 4h/8h 标「不适用」、4h/8h 桶按 CST 夜盘 21:00 对齐 |
+| 前端 | 手动预测状态不再冻结、`pull()` 回填时序修正、5 秒轮询改为数据签名变化才重绘（事件委托）、命中率实时刷新 |
+| 服务端全对齐 | 新增 `/api/app/state`、`/api/app/snapshot`、`/api/app/kline`（8 周期、ts 毫秒）、`/api/app/forecast`（7 档）、`/api/sync/check`、`/api/sync/repair`（分批幂等）；`kline_multi` 多周期真实落库；既有 REST/WS/`docs` 契约不变 |
+| 对照开关 | 设置页「服务端对照」：地址默认 `http://127.0.0.1:8000`，开关 + 测试连接；开启后单次 `serverGet('/api/app/snapshot?...')` 取数并复用现有渲染，显示本地/服务端报价、K 线根数、预测方向差异；5 秒超时、失败 30 秒冷却并自动回退本地 |
+
+### 服务端本地部署（WSL Debian）
+
+```bash
+cd ~/projects/futures-forecast
+python3 -m venv backend/.venv
+backend/.venv/bin/pip install -r backend/requirements.txt
+bash run.sh                      # 默认 http://127.0.0.1:8000，/docs 为接口文档
+```
+
+Windows 侧经 WSL2 localhostForwarding 可直接访问 `http://127.0.0.1:8000`。
+需要局域网访问时显式 `FF_HOST=0.0.0.0 bash run.sh`（生产请加反向代理与认证）。
+
+### 分批补全的能力边界（实测源站）
+
+`InnerFuturesNewService.getFewMinLine?type=N` 固定返回 1023 根，`num/count/datalen/start/end/date/scale` 均无效，
+无历史分页接口，`getMinLine` 也不接受日期参数。按 `type` 切换才有更长历史：1m≈2 交易日、5m≈15 天、
+15m≈2 个月、30m≈3 个月、60m≈6 个月。因此 **1m 的 7 天前空洞不可补**，App 不插值不伪造，
+报告逐周期给出真实覆盖起点；5m/15m/30m/60m 可补满近 7 天。
+
+## 十、免责声明
 
 本项目为量化统计研究与可视化演示，所有预测与建议均不构成投资建议。期货交易有杠杆风险，请自行判断并控制仓位。

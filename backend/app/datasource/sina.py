@@ -16,13 +16,15 @@ Therefore "second level" history has to be accumulated locally over time.
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
-
-CST = timezone(timedelta(hours=8))
 from typing import Iterable
 
 from ..config import PRODUCT_BY_CODE
 from .http_util import get_text, jsonp_to_json
+
+CST = timezone(timedelta(hours=8))
+log = logging.getLogger("sina")
 
 SINA_RT = "https://hq.sinajs.cn/list={syms}"
 SINA_INNER_MIN = (
@@ -52,26 +54,46 @@ def _f(v: str | float | None) -> float | None:
         return None
 
 
-_NOW_CST = lambda: datetime.now(timezone(timedelta(hours=8)))
+_NOW_CST = lambda: datetime.now(CST)
+
+
+def _parse_ts(value) -> datetime | None:
+    """把 bar 时间戳解析为带时区的 datetime；无法解析返回 None。
+
+    兼容 "YYYY-MM-DD HH:MM:SS"、"YYYY-MM-DD" 以及 ISO 8601（T / 时区 / Z）。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        try:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=CST)
+    return dt
 
 
 def _drop_future(bars: list[dict], slack_hours: int = 2) -> list[dict]:
     """Sina appends a placeholder bar dated at the next session open.
 
     It is not real data (same price, tiny volume), so drop bars timestamped
-    clearly in the future to keep the chart and features honest.
+    clearly in the future to keep the chart and features honest. 日线只有
+    "YYYY-MM-DD"（10 位）、分钟线含完整时间，两种格式都要能解析。
     """
     limit = _NOW_CST() + timedelta(hours=slack_hours)
     out = []
     for b in bars:
         # live API rows use "t"; DB rows use "ts"
-        t = b.get("t") or b.get("ts") or ""
-        try:
-            dt = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CST)
-        except ValueError:
+        dt = _parse_ts(b.get("t") or b.get("ts") or "")
+        if dt is None:            # 无法解析时保守保留，避免误删真实数据
             out.append(b)
-            continue
-        if dt <= limit:
+        elif dt <= limit:
             out.append(b)
     return out
 
@@ -95,6 +117,14 @@ def parse_realtime(text: str) -> dict[str, dict]:
                 code = p["code"]
                 break
         if code is None:
+            continue
+        # 字段数校验：短响应直接跳过该品种并记录日志，避免未校验索引抛
+        # IndexError 导致整批（三品种）快照全部丢失。内盘用到 parts[14]、
+        # 外盘用到 parts[13]，按各自实际字段数取阈值。
+        need = 15 if sym.startswith("nf_") else 14
+        if len(parts) < need:
+            log.warning("realtime %s 字段数不足 (%d<%d)，跳过该品种",
+                        sym, len(parts), need)
             continue
 
         q: dict = {"code": code, "ts": datetime.now(timezone.utc).isoformat()}
@@ -182,7 +212,7 @@ async def fetch_daily(code: str) -> list[dict]:
     if p["market"] == "inner":
         url = SINA_INNER_DAY.format(sym=p["day_sym"])
         raw = jsonp_to_json(await get_text(url))
-        return [
+        bars = [
             {
                 "t": r.get("d"),
                 "o": _f(r.get("o")),
@@ -195,41 +225,73 @@ async def fetch_daily(code: str) -> list[dict]:
             for r in (raw if isinstance(raw, list) else [])
             if r.get("d") and r.get("c")
         ]
+    else:
+        url = SINA_GLOBAL_DAY.format(sym=p["day_sym"])
+        raw = jsonp_to_json(await get_text(url))
+        bars = [
+            {
+                "t": r.get("date"),
+                "o": _f(r.get("open")),
+                "h": _f(r.get("high")),
+                "l": _f(r.get("low")),
+                "c": _f(r.get("close")),
+                "v": _f(r.get("volume")),
+                "oi": _f(r.get("position")),
+            }
+            for r in (raw if isinstance(raw, list) else [])
+            if r.get("date") and r.get("close")
+        ]
+    # 日线同样会带下一交易日的未来占位 bar，入库/入 state 前统一剔除。
+    return _drop_future(bars)
 
-    url = SINA_GLOBAL_DAY.format(sym=p["day_sym"])
-    raw = jsonp_to_json(await get_text(url))
-    return [
-        {
-            "t": r.get("date"),
-            "o": _f(r.get("open")),
-            "h": _f(r.get("high")),
-            "l": _f(r.get("low")),
-            "c": _f(r.get("close")),
-            "v": _f(r.get("volume")),
-            "oi": _f(r.get("position")),
-        }
-        for r in (raw if isinstance(raw, list) else [])
-        if r.get("date") and r.get("close")
-    ]
+
+def _fetch_error(errors: list[str] | None, code: str, kind: str,
+                 exc: BaseException) -> None:
+    """异常记详细日志（含 URL），把脱敏摘要登记到错误出参供 collector 记录。"""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is not None:
+        reason = f"HTTP {status}"
+    else:
+        low = str(exc).lower()
+        if (isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                or "timeout" in low or "timed out" in low):
+            reason = "timeout"
+        else:
+            reason = type(exc).__name__
+    msg = f"{code} {kind}: {reason}"
+    log.warning("sina %s 拉取失败: %s", msg, exc)   # 详细异常（含 URL）只写日志
+    if errors is not None:
+        errors.append(msg)
 
 
-async def fetch_all_minute(period: int = 1) -> dict[str, list[dict]]:
+async def fetch_all_minute(period: int = 1,
+                           errors: list[str] | None = None) -> dict[str, list[dict]]:
     codes = list(PRODUCT_BY_CODE)
     results = await asyncio.gather(
         *(fetch_minute(c, period) for c in codes), return_exceptions=True
     )
     out: dict[str, list[dict]] = {}
     for c, r in zip(codes, results):
-        out[c] = r if isinstance(r, list) else []
+        if isinstance(r, list):
+            out[c] = r
+        else:
+            out[c] = []
+            _fetch_error(errors, c, "minute",
+                         r if isinstance(r, BaseException) else Exception(str(r)))
     return out
 
 
-async def fetch_all_daily() -> dict[str, list[dict]]:
+async def fetch_all_daily(errors: list[str] | None = None) -> dict[str, list[dict]]:
     codes = list(PRODUCT_BY_CODE)
     results = await asyncio.gather(
         *(fetch_daily(c) for c in codes), return_exceptions=True
     )
     out: dict[str, list[dict]] = {}
     for c, r in zip(codes, results):
-        out[c] = r if isinstance(r, list) else []
+        if isinstance(r, list):
+            out[c] = r
+        else:
+            out[c] = []
+            _fetch_error(errors, c, "daily",
+                         r if isinstance(r, BaseException) else Exception(str(r)))
     return out

@@ -18,6 +18,8 @@ import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 大模型预测客户端：OpenAI 兼容协议，默认 DeepSeek。
@@ -168,6 +170,12 @@ public class LlmClient {
             String base = cfg.llmBase();
             while (base.endsWith("/")) base = base.substring(0, base.length() - 1);
             String url = base + "/chat/completions";
+            // 请求前二次校验：即使配置被历史值/篡改写成 http 或内网地址，
+            // 也绝不把 Bearer Key 发出去（与 Cfg.setLlmBase 形成双保险）。
+            if (!Cfg.isValidLlmBase(url)) {
+                r.text = "请求失败：llm_base 不是合法的公网 HTTPS 地址，已阻止发送";
+                return r;
+            }
 
             JSONArray messages = new JSONArray();
             JSONObject sys = new JSONObject();
@@ -190,7 +198,7 @@ public class LlmClient {
             JSONObject obj = new JSONObject(resp);
             JSONArray choices = obj.optJSONArray("choices");
             if (choices == null || choices.length() == 0) {
-                r.text = "模型返回为空：" + trim(resp, 200);
+                r.text = "模型返回为空（响应无有效内容）";
                 return r;
             }
             String content = choices.optJSONObject(0)
@@ -201,7 +209,7 @@ public class LlmClient {
             r.ok = true;
             return r;
         } catch (Exception e) {
-            r.text = "请求失败：" + e.getMessage();
+            r.text = "请求失败：" + Cfg.redact(brief(e));
             return r;
         }
     }
@@ -261,22 +269,29 @@ public class LlmClient {
 
     private static String post(String url, String key, String payload) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
-        c.setRequestMethod("POST");
-        c.setConnectTimeout(20000);
-        c.setReadTimeout(120000);
-        c.setDoOutput(true);
-        c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
-        c.setRequestProperty("Authorization", "Bearer " + key);
-        c.setRequestProperty("User-Agent", SinaClient.UA);
-        try (OutputStream os = c.getOutputStream()) {
-            os.write(payload.getBytes(StandardCharsets.UTF_8));
+        try {
+            c.setRequestMethod("POST");
+            c.setConnectTimeout(20000);
+            c.setReadTimeout(120000);
+            c.setDoOutput(true);
+            c.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            c.setRequestProperty("Authorization", "Bearer " + key);
+            c.setRequestProperty("User-Agent", SinaClient.UA);
+            try (OutputStream os = c.getOutputStream()) {
+                os.write(payload.getBytes(StandardCharsets.UTF_8));
+            }
+            int code = c.getResponseCode();
+            InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
+            String text;
+            try (InputStream stream = in) {   // 流可能为 null，try-with-resources 自动跳过 null
+                text = readAll(stream);
+            }
+            // 错误只回状态码，绝不把第三方响应体拼进异常
+            if (code >= 400) throw new IllegalStateException("HTTP " + code);
+            return text;
+        } finally {
+            c.disconnect();                    // 异常路径也一定会断开
         }
-        int code = c.getResponseCode();
-        InputStream in = code >= 400 ? c.getErrorStream() : c.getInputStream();
-        String text = readAll(in);
-        c.disconnect();
-        if (code >= 400) throw new IllegalStateException("HTTP " + code + " " + trim(text, 300));
-        return text;
     }
 
     private static String readAll(InputStream in) throws Exception {
@@ -301,8 +316,12 @@ public class LlmClient {
         }
     }
 
-    private static String trim(String s, int n) {
-        if (s == null) return "";
-        return s.length() <= n ? s : s.substring(0, n) + "…";
+    /** 错误只保留异常类型 + HTTP 状态码，绝不回显响应体 / URL / 令牌。 */
+    private static String brief(Exception e) {
+        String type = e.getClass().getSimpleName();
+        String msg = e.getMessage();
+        if (msg == null) return type;
+        Matcher m = Pattern.compile("HTTP\\s*\\d{3}").matcher(msg);
+        return m.find() ? type + " (" + m.group().trim() + ")" : type;
     }
 }

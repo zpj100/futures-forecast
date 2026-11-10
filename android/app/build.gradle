@@ -1,5 +1,28 @@
 apply plugin: 'com.android.application'
 
+// 签名口令只从（未跟踪、被 .gitignore 忽略的）android/local.properties 读取，绝不写死在仓库里。
+// 文件不存在 / 缺项时直接给出清晰报错，避免悄悄用默认签名或把口令带进版本库。
+def ksPropsFile = rootProject.file('local.properties')
+if (!ksPropsFile.exists()) {
+    throw new GradleException(
+            "缺少 ${ksPropsFile}：请在本机创建该未跟踪文件并填写 " +
+            "keystore.file / keystore.storePassword / keystore.keyPassword / keystore.alias（含口令，禁止提交 git）")
+}
+def ksProps = new Properties()
+ksPropsFile.withInputStream { ksProps.load(it) }
+def ksFile = ksProps.getProperty('keystore.file')
+def ksStorePassword = ksProps.getProperty('keystore.storePassword')
+def ksKeyPassword = ksProps.getProperty('keystore.keyPassword')
+def ksAlias = ksProps.getProperty('keystore.alias')
+if (!ksFile || !ksStorePassword || !ksKeyPassword || !ksAlias) {
+    throw new GradleException(
+            "${ksPropsFile} 必须同时包含 keystore.file / keystore.storePassword / keystore.keyPassword / keystore.alias")
+}
+// keystore.file 相对仓库根目录（与 build-apk.sh 约定一致）
+def repoRoot = ksPropsFile.parentFile.parentFile
+def ksResolved = new File(ksFile)
+if (!ksResolved.isAbsolute()) ksResolved = new File(repoRoot, ksFile)
+
 android {
     namespace 'com.zpj.futures'
     compileSdk 34
@@ -7,15 +30,15 @@ android {
         applicationId 'com.zpj.futures'
         minSdk 24
         targetSdk 34
-        versionCode 240
-        versionName '2.4.0'
+        versionCode 250
+        versionName '2.5.0'
     }
     signingConfigs {
         release {
-            storeFile file('keystore.jks')
-            storePassword 'futures2026'
-            keyAlias 'futures'
-            keyPassword 'futures2026'
+            storeFile file(ksResolved)
+            storePassword ksStorePassword
+            keyAlias ksAlias
+            keyPassword ksKeyPassword
         }
     }
     buildTypes {
@@ -23,9 +46,7 @@ android {
             minifyEnabled false
             signingConfig signingConfigs.release
         }
-        debug {
-            signingConfig signingConfigs.release
-        }
+        // debug 使用 AGP 默认的 debug 签名，不再复用 release 签名
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17

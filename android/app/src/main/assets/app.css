@@ -673,3 +673,36 @@ html.light .btn.danger { background: #ffffff; color: var(--up); border-color: rg
   color: var(--muted);
 }
 html.light .lm-t { color: #16324f; }
+
+/* ---------- 服务端对照 ---------- */
+.server-toggle { margin-top: 12px; }
+.server-toggle input { width: 16px; height: 16px; }
+.server-state {
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px dashed var(--line2);
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: var(--inner);
+}
+.server-state.ok { color: var(--down); border-color: rgba(46, 189, 133, .4); }
+.server-state.err { color: var(--up); border-color: rgba(246, 70, 93, .4); }
+.server-state .server-cmp { color: var(--muted); }
+.server-compare {
+  margin: 2px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line2);
+  border-radius: 10px;
+  background: var(--inner);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--muted);
+  word-break: break-word;
+}
+.server-compare[hidden] { display: none; }

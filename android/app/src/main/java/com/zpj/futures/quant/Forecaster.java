@@ -32,6 +32,12 @@ public class Forecaster {
             {"1d", "1天", "1440"},
     };
 
+    /**
+     * CST 夜盘 21:00 对应的 UTC 毫秒相位（Asia/Shanghai = UTC+8，21:00 CST = 13:00 UTC）。
+     * 用于 4h/8h 时间桶对齐：桶边界从夜盘开盘 21:00 起算，而非 UTC 自然整点。
+     */
+    public static final long CST_21_00_OFFSET = 13L * 3600_000L;
+
     public static JSONObject forecast(String code, List<Bar> minute, List<Bar> hour60,
                                       List<Bar> daily) {
         return forecast(code, minute, hour60, daily, null, false);
@@ -52,6 +58,29 @@ public class Forecaster {
         for (String[] h : HORIZONS) {
             String key = h[0];
             int minutes = Integer.parseInt(h[2]);
+
+            // 伦铝 AHD 没有 60m 序列，4h/8h 恒「数据不足」。明确标「不适用」，
+            // 并从综合投票分母 wsumTotal 剔除，避免 0.05 的无效权重稀释 score。
+            if ("AHD".equals(code) && (minutes == 240 || minutes == 480)) {
+                JSONObject na = new JSONObject();
+                try {
+                    na.put("key", key);
+                    na.put("label", h[1]);
+                    na.put("minutes", minutes);
+                    na.put("direction", "不适用");
+                    na.put("p_up", 0.5);
+                    na.put("confidence", 0);
+                    na.put("exp_move_pct", 0);
+                    na.put("target_price", Indicators.round(price, 3));
+                    na.put("best_hit", 0);
+                    na.put("signals", new JSONObject());
+                    na.put("note", "伦铝源站仅提供当日分时/日线，无 60 分钟序列，此档不适用");
+                } catch (Exception ignored) {
+                }
+                horizons.put(na);
+                continue;
+            }
+
             // 4h/8h 由 60 分钟线聚合，日线直接用，其余用 1 分钟线；
             // 聚合后「下一根」就是目标周期，因此走前验证的步长按 1 根算
             List<Bar> src;
@@ -120,8 +149,10 @@ public class Forecaster {
     }
 
     /**
-     * 按时间桶聚合成 OHLCV：桶起点 = ⌊ts / 周期⌋ × 周期。
-     * 用时间对齐而不是「每 N 根一组」，否则序列首根错位会让 4h/8h 落在奇怪的时刻。
+     * 按时间桶聚合成 OHLCV。
+     * 短周期（≤60m）桶起点 = ⌊ts / 周期⌋ × 周期（UTC 自然桶）；
+     * 4h/8h 按 CST 夜盘 21:00 对齐：t = ts - floorMod(ts - CST_21_00_OFFSET, bucket)。
+     * 用时间对齐而不是「每 N 根一组」，否则序列首根错位会让长周期落在奇怪的时刻。
      */
     public static List<Bar> aggregateByTime(List<Bar> src, int minutes) {
         List<Bar> out = new ArrayList<>();
@@ -131,10 +162,11 @@ public class Forecaster {
             return out;
         }
         long bucket = minutes * 60_000L;
+        long align = minutes >= 240 ? CST_21_00_OFFSET : 0L;
         long curTs = Long.MIN_VALUE;
         Bar cur = null;
         for (Bar b : src) {
-            long t = b.ts - Math.floorMod(b.ts, bucket);
+            long t = b.ts - Math.floorMod(b.ts - align, bucket);
             if (cur == null || t != curTs) {
                 if (cur != null) out.add(cur);
                 curTs = t;
@@ -148,11 +180,30 @@ public class Forecaster {
         return out;
     }
 
+    /**
+     * 可验证性质（高波动概率更保守）：固定 conviction / evidence / horizonBars，
+     * sigma 越大，pRaw 越接近 0.5，即 ∂|pRaw-0.5|/∂sigma &lt; 0。
+     *
+     * <p>关键修复：分子 edge 不含 sigma，sigma 只出现在分母且不会被代数约掉
+     * （旧实现 horizonScale=sigma*sqrt(bars)*0.5、pRaw=phi(edge/sigma)，sigma 被约掉，
+     * 导致 p_up 与波动率无关）。
+     */
+    static double pUpFrom(double conviction, double evidence, double sigma, int horizonBars) {
+        double hb = Math.sqrt(Math.max(horizonBars, 1));
+        double edge = conviction * hb * 0.5 * evidence;      // 不含 sigma
+        double denom = sigma * hb + 1e-9;                    // sigma 真正留在分母
+        return phi(edge / denom);
+    }
+
     private static JSONObject one(String key, String label, int minutes,
                                   List<Bar> bars, int horizonBars, int lookback,
                                   double fallbackPrice) {
         JSONObject o = new JSONObject();
-        if (bars == null || bars.size() < Math.max(horizonBars + 12, 30)) {
+        // 长周期（4h/8h/1d）样本天然偏少，适度放宽「数据不足」与走前验证的样本阈值，
+        // 避免恒被判成「震荡」。短周期仍保持原来的严格阈值。
+        boolean longHorizon = minutes >= 240;
+        int minBars = longHorizon ? Math.max(horizonBars + 8, 20) : Math.max(horizonBars + 12, 30);
+        if (bars == null || bars.size() < minBars) {
             try {
                 o.put("key", key);
                 o.put("label", label);
@@ -185,9 +236,10 @@ public class Forecaster {
         double[][] sigs = {trend, rev, boll, mom};
         JSONObject details = new JSONObject();
 
+        int minTotal = longHorizon ? 4 : 8;
         double weighted = 0, wsum = 0, bestHit = 0;
         for (int i = 0; i < names.length; i++) {
-            double hit = walkForward(c, sigs[i], horizonBars);
+            double hit = walkForward(c, sigs[i], horizonBars, minTotal);
             double excess = Math.max(0, hit - 0.5);
             double w = excess >= 0.02 ? excess : 0;
             double sv = sigs[i][n - 1];
@@ -218,18 +270,20 @@ public class Forecaster {
             sigma = Math.sqrt(Math.max(sum2 / cnt - mean * mean, 1e-12));
         }
 
-        double edge = 0, pUp = 0.5;
+        double move = 0, pUp = 0.5;
         if (wsum > 0) {
             double conviction = weighted / wsum;
             double evidence = Math.min(wsum / 0.25, 1.0);
-            double horizonScale = sigma * Math.sqrt(horizonBars) * 0.5;
-            edge = conviction * horizonScale * evidence;
-            double pRaw = phi(edge / sigma);
+            // p_up：sigma 留在分母（见 pUpFrom 的性质），高波动更保守
+            double pRaw = pUpFrom(conviction, evidence, sigma, horizonBars);
             double cap = 0.5 + 0.35 * Math.min(wsum / 0.20, 1.0);
             pUp = Math.min(Math.max(pRaw, 1.0 - cap), cap);
+            // 预期对数收益幅度仍带 sigma：保持 exp_move_pct / target_price 的原有量纲
+            double hb = Math.sqrt(Math.max(horizonBars, 1));
+            move = conviction * (sigma * hb) * 0.5 * evidence;
         }
-        double expPct = (Math.exp(edge) - 1) * 100;
-        double target = px * Math.exp(edge);
+        double expPct = (Math.exp(move) - 1) * 100;
+        double target = px * Math.exp(move);
         double conf = Math.min(Math.abs(pUp - 0.5) * 2, 1);
         String dir = pUp >= 0.55 ? "上涨" : pUp <= 0.45 ? "下跌" : "震荡";
 
@@ -294,8 +348,12 @@ public class Forecaster {
         return s;
     }
 
-    /** 尾部 45% 段的方向命中率。 */
+    /** 尾部 45% 段的方向命中率；样本不足返回 0.5。 */
     static double walkForward(double[] c, double[] sig, int step) {
+        return walkForward(c, sig, step, 8);
+    }
+
+    static double walkForward(double[] c, double[] sig, int step, int minTotal) {
         int n = c.length;
         int from = (int) Math.floor(n * 0.55);
         int hit = 0, total = 0;
@@ -306,7 +364,7 @@ public class Forecaster {
             total++;
             if ((fwd > 0 && sig[i] > 0) || (fwd < 0 && sig[i] < 0)) hit++;
         }
-        return total < 8 ? 0.5 : (double) hit / total;
+        return total < Math.max(1, minTotal) ? 0.5 : (double) hit / total;
     }
 
     static double phi(double z) {
