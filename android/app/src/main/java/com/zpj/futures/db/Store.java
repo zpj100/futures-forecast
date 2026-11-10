@@ -10,7 +10,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 手机端本地库：秒级快照 / K 线 / 预测留档。
@@ -219,6 +221,56 @@ public class Store extends SQLiteOpenHelper {
     /** kline 表总行数（判断预置库是否需要导入）。 */
     public int countKlineAll() {
         return scalar("SELECT COUNT(*) FROM kline");
+    }
+
+    // ---------------- 体检辅助（同步前完整性检查用） ----------------
+
+    /** 某周期在 sinceMs 之后本地有多少根。 */
+    public int countKlineSince(String code, String period, long sinceMs) {
+        return scalar("SELECT COUNT(*) FROM kline WHERE code='" + sqlStr(code)
+                + "' AND period='" + sqlStr(period) + "' AND ts>=" + sinceMs);
+    }
+
+    /** sinceMs 之后本地已有的全部时间戳（用于和源站逐根比对，找出空洞）。 */
+    public Set<Long> klineTsSet(String code, String period, long sinceMs) {
+        Set<Long> out = new HashSet<>();
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT ts FROM kline WHERE code=? AND period=? AND ts>=?",
+                new String[]{code, period, String.valueOf(sinceMs)});
+        try {
+            while (c.moveToNext()) out.add(c.getLong(0));
+        } finally {
+            c.close();
+        }
+        return out;
+    }
+
+    /** sinceMs 之后本地最早那根的时间；没有则 0。用于报告「实际覆盖起点」。 */
+    public long firstKlineTsSince(String code, String period, long sinceMs) {
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT MIN(ts) FROM kline WHERE code=? AND period=? AND ts>=?",
+                new String[]{code, period, String.valueOf(sinceMs)});
+        try {
+            return c.moveToFirst() && !c.isNull(0) ? c.getLong(0) : 0L;
+        } finally {
+            c.close();
+        }
+    }
+
+    /** 秒级快照在 sinceMs 之后的点数。 */
+    public int countTicksSince(String code, long sinceMs) {
+        Cursor c = getReadableDatabase().rawQuery(
+                "SELECT COUNT(*) FROM ticks WHERE code=? AND ts>=?",
+                new String[]{code, String.valueOf(sinceMs)});
+        try {
+            return c.moveToFirst() ? c.getInt(0) : 0;
+        } finally {
+            c.close();
+        }
+    }
+
+    private static String sqlStr(String s) {
+        return s == null ? "" : s.replace("'", "''");
     }
 
     // ---------------- forecasts ----------------

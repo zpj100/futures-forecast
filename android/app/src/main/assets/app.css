@@ -552,6 +552,22 @@ html.light .btn.danger { background: #ffffff; color: var(--up); border-color: rg
 }
 .prog.done > i { background: linear-gradient(90deg, var(--down), var(--cyan)); }
 .prog.fail > i { background: var(--up); box-shadow: none; }
+/* 失败时整条轨道带红底，避免进度为 0 时看不出失败态 */
+.prog.fail { background: rgba(246, 70, 93, .18); }
+/* 检查完成但无新版本：灰色完成态，不抢眼但要能看出「已走完」 */
+.prog.idle > i { background: var(--flat); opacity: .8; box-shadow: none; }
+
+/* ---------- 勾选项 ---------- */
+.chk {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.chk input { width: 15px; height: 15px; accent-color: var(--cyan); flex: none; }
 @keyframes progSlide {
   0% { transform: translateX(-100%); }
   100% { transform: translateX(280%); }
@@ -561,8 +577,9 @@ html.light .btn.danger { background: #ffffff; color: var(--up); border-color: rg
   gap: 8px; margin-top: 5px;
   font-family: var(--mono); font-size: 10.5px; color: var(--muted);
 }
+.prog-meta > span:first-child { flex: 1 1 auto; min-width: 0; }
 .prog-meta #updProgPct, .prog-meta #syncProgPct,
-.prog-meta #predProgPct { flex: 0 0 auto; color: var(--text); }
+.prog-meta #predProgPct { flex: 0 0 auto; margin-left: 10px; color: var(--text); }
 @media (prefers-reduced-motion: reduce) {
   .prog > i { transition: none; }
   .prog.indet > i { animation: none; width: 100% !important; opacity: .45; }

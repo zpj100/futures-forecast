@@ -166,14 +166,27 @@ public class Bridge {
         emit("onToast", q("预测记录已清空"));
     }
 
-    /** 同步最近 180 天历史（日线 + 各周期分钟线）。 */
+    /**
+     * 同步历史数据：先做最近 7 天体检（缺失/清空就回补），无缺口再走增量。
+     * 详细结论在 onSync 的 check / ticks / coverage / note 字段里。
+     */
     @JavascriptInterface
     public void syncHistory() {
+        syncHistory0(false);
+    }
+
+    /** 强制全量重写最近 7 天（数据错乱时手动使用）。 */
+    @JavascriptInterface
+    public void syncHistoryForce(boolean force) {
+        syncHistory0(force);
+    }
+
+    private void syncHistory0(final boolean force) {
         if (engine.isSyncing()) {
             emit("onToast", q("同步正在进行中，请稍候"));
             return;
         }
-        emit("onToast", q("开始同步最近 180 天数据…"));
+        emit("onToast", q(force ? "强制全量重写近 7 天…" : "开始体检并同步最近 180 天数据…"));
         pool.execute(() -> {
             JSONObject res = engine.syncHistory((msg, done, total) -> {
                 JSONObject o = new JSONObject();
@@ -185,7 +198,7 @@ public class Bridge {
                 } catch (Exception ignored) {
                 }
                 emit("onSyncStep", o.toString());
-            });
+            }, force);
             emit("onSync", res.toString());
         });
     }
@@ -383,7 +396,7 @@ public class Bridge {
     @JavascriptInterface
     public void checkUpdate() {
         pool.execute(() -> {
-            Updater.Info info = new Updater(ctx, cfg).check();
+            Updater.Info info = new Updater(ctx, cfg).check(this::emitCheckProgress);
             JSONObject o = new JSONObject();
             try {
                 o.put("ok", info.ok);
@@ -400,6 +413,20 @@ public class Bridge {
             }
             emit("onUpdate", o.toString());
         });
+    }
+
+    /** 检查阶段的分阶段进度：pct=0 表示不确定态（还没读到发行版）。 */
+    private void emitCheckProgress(String msg, int pct) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("phase", "check");
+            o.put("msg", msg);
+            o.put("pct", Math.max(0, Math.min(100, pct)));
+            o.put("done", Math.max(0, pct));
+            o.put("total", 100);
+        } catch (Exception ignored) {
+        }
+        emit("onUpdateProgress", o.toString());
     }
 
     private static String stripNotes(String s) {

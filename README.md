@@ -216,6 +216,27 @@ bash android/build-apk.sh
 装好后无需任何配置即可看到行情；要大模型分析就在「设置」填 API Key，
 要 App 内自助更新就在「设置」填 Gitee 个人令牌。
 
+### 体检式同步与全链路进度条（v2.4.0）
+
+「同步历史数据」不再无脑追尾：先对最近 **7 天**做完整性体检，再决定补还是只增量。
+
+| 情况 | 判据（以源站序列为基准逐根比对） | 动作 |
+|------|--------------------------------|------|
+| 中间空洞 | 源站有、本地没有，且早于本地最后一根 | 该周期近 7 天窗口整体 REPLACE 回补 |
+| 整段清空 | 本地近 7 天 0 根而源站有数据 | 同上，全窗写回 |
+| 正常尾部 | 源站有、本地没有，但晚于本地最后一根 | 只写尾部（原增量口径） |
+| 完好 | 无空洞无清空 | 仅增量到最新 |
+
+- 逐根比对源站序列，不自建交易日历 → 夜盘、周末、节假日不会误判成缺失。
+- 秒级（ticks）不回溯：只校验最近 30 分钟是否还在进点，最新点过期立即补一次实时报价。
+- 报告写清体检结论（扫描组数 / 空洞根数与段数 / 清空组数）、秒级点数与**实际覆盖起点**；
+  受源站 1023 根上限，1m 约 2 个交易日，7 天的 1m 空洞补不全时会如实标注。
+- 设置页新增勾选「强制全量重写近 7 天」，仅数据错乱时手动用。
+
+更新链路也补全了进度反馈：点「检查更新」立刻出现进度条（读发行版时不确定态，解析到 release 后转确定），
+无新版落成灰色完成态，有新版直接续成下载进度；下载显示 `1.9 / 3.0 MB · 947 KB/s · 剩余 1 秒`；
+下载完 100% 保持并提示「正在调起系统安装器」；失败时轨道染红、按钮变「重试更新」直接重下，无需重新检查。
+
 ## 八、版本与自动更新
 
 版本号规则：`versionCode = 主*100 + 次*10 + 修订`（2.3.0 → 230），Release 正文首行标注 `versionCode: 230`。
@@ -240,16 +261,16 @@ bash android/build-apk.sh
 
 ```json
 {
-  "version": "2.3.0",
-  "versionCode": 230,
+  "version": "2.4.0",
+  "versionCode": 240,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "notes": "…"
 }
 ```
 
 发新版流程：改 `android/app/build.gradle` 的 `versionCode` / `versionName`
-→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.3.0`）
-→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 230`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
+→ `bash android/build-apk.sh` → 更新 `release/version.json` → 提交并打 tag（`v2.4.0`）
+→ 创建 Gitee Release 并上传 APK（正文必须含 `versionCode: 240`）→ `python3 scripts/delete_asset.py` 可清理旧附件。
 
 ## 九、免责声明
 

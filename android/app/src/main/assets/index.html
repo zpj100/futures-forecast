@@ -165,6 +165,7 @@
         <div class="row-btns">
           <button class="btn" id="btnSyncHistory">同步历史数据</button>
         </div>
+        <label class="chk"><input type="checkbox" id="chkForceResync"><span>强制全量重写近 7 天（数据错乱时再勾）</span></label>
         <div class="prog-wrap" id="syncProgWrap" hidden>
           <div class="prog"><i id="syncProgBar"></i></div>
           <div class="prog-meta">
@@ -172,7 +173,7 @@
             <span id="syncProgPct">0%</span>
           </div>
         </div>
-        <div class="hint" id="syncInfo">同步最近 180 天：日线 + 分钟线（源站每周期最多 1023 根，60 分钟线可覆盖约 195 天）。安装包内已预置一份，平常无需手动同步。</div>
+        <div class="hint" id="syncInfo">同步先做最近 7 天体检：逐根比对源站与本地，缺失或整段被清空就回补，无缺失才走增量。源站每周期最多 1023 根（1 分钟线约 2 个交易日），补不到的会如实标出覆盖起点；秒级只能本机采集。</div>
         <div class="row-btns">
           <button class="btn ghost danger" id="btnClearFc">清空预测记录</button>
         </div>

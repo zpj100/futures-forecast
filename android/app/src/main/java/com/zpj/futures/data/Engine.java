@@ -15,6 +15,7 @@ import org.json.JSONObject;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -448,13 +449,30 @@ public class Engine {
         return syncing.get();
     }
 
-    /**
-     * 同步历史数据：与官方源做**增量**合并。
-     * 日线取近 180 天窗口，分钟线取源站当前可给的最近 1023 根；
-     * 只把「本地最后一根及之后」的 bar 写库（boundary 那根会被 REPLACE 刷新），
-     * 因此重复点击不会重复写库，只会补上新的增量。
-     */
+    /** 完整性体检窗口：最近 7 天。 */
+    public static final int CHECK_DAYS = 7;
+
+    /** 秒级快照只能本机采集，体检只看最近 30 分钟是否还在进点。 */
+    private static final long TICK_WINDOW_MS = 30 * 60_000L;
+
     public JSONObject syncHistory(SyncListener cb) {
+        return syncHistory(cb, false);
+    }
+
+    /**
+     * 同步历史数据：**体检 → 补齐 → 增量** 三段（v2.4.0）。
+     *
+     * <p>体检把源站返回的序列当基准，逐根比对本地时间戳：源站有、本地没有 = 缺失；
+     * 本地该周期近 7 天一根都没有而源站有 = 被清空。有缺失/清空就把该周期窗口内的 bar
+     * 整体 REPLACE 写回（可回补历史空洞），没有缺失才走原来的 tail 增量。
+     * 以源站序列为基准可以完全避开自建交易日历，夜盘、周末、节假日都不会误判。
+     *
+     * <p>源站单周期上限 1023 根（1m≈2 个交易日、5m≈9 天、15m≈27 天），
+     * 因此 7 天的 1m 空洞可能补不全，返回值里如实给出「实际覆盖起点」。
+     *
+     * @param forceFull true 时忽略缺失判定，把近 7 天窗口整体重写（数据错乱时手动使用）
+     */
+    public JSONObject syncHistory(SyncListener cb, boolean forceFull) {
         JSONObject res = new JSONObject();
         if (!syncing.compareAndSet(false, true)) {
             try {
@@ -465,43 +483,126 @@ public class Engine {
             return res;
         }
         long now = System.currentTimeMillis();
-        long cut = now - 180L * 86400_000L;
-        int added = 0;
+        long dailyCut = now - 180L * 86400_000L;
+        long checkCut = now - CHECK_DAYS * 86400_000L;
+        List<Job> jobs = new ArrayList<>();
+        for (String code : Products.CODES) {
+            for (String period : periodsOf(code)) jobs.add(new Job(code, period));
+        }
+        int totalSteps = jobs.size() * 2 + 2;
         int step = 0;
-        int totalSteps = 0;
-        for (String code : Products.CODES) totalSteps += periodsOf(code).length;
+        int added = 0, scanned = 0, missing = 0, gaps = 0, cleared = 0;
+        int healedItems = 0, healedBars = 0;
         StringBuilder fail = new StringBuilder();
         JSONObject detail = new JSONObject();
+        JSONObject coverage = new JSONObject();
         try {
-            for (String code : Products.CODES) {
-                String name = Products.nameOf(code);
-                JSONObject one = new JSONObject();
-                String[] periods = periodsOf(code);
-                for (String period : periods) {
-                    if (cb != null) {
-                        cb.onStep("同步 " + name + " " + labelOf(period) + "…", step, totalSteps);
-                    }
-                    JSONObject r = syncOne(code, period, cut);
-                    one.put(period, r);
-                    added += r.optInt("added", 0);
-                    if (r.has("error")) {
-                        fail.append(name).append(labelOf(period))
-                                .append("[").append(r.optString("error")).append("] ");
-                    }
-                    step++;
-                    Thread.sleep("1d".equals(period) ? 220 : 260);
+            // ---------- 第 1 段：体检（拉一次源站数据并缓存，写入阶段复用） ----------
+            for (Job j : jobs) {
+                if (cb != null) {
+                    cb.onStep("体检 " + Products.nameOf(j.code) + " " + labelOf(j.period) + "…",
+                            step, totalSteps);
                 }
-                detail.put(code, one);
+                try {
+                    j.bars = "1d".equals(j.period)
+                            ? within(sina.daily(j.code), dailyCut)
+                            : sina.minute(j.code, SinaClient.typeOf(j.period));
+                } catch (Exception e) {
+                    j.error = brief(e);
+                }
+                if (j.bars == null) j.bars = new ArrayList<>();
+                if (!j.bars.isEmpty()) {
+                    analyze(j, checkCut);
+                    scanned++;
+                    missing += j.missing;
+                    gaps += j.gaps;
+                    if (j.cleared) cleared++;
+                }
+                step++;
+                Thread.sleep("1d".equals(j.period) ? 160 : 220);
             }
-            if (cb != null) cb.onStep("写入本地库并刷新…", totalSteps, totalSteps);
+            if (cb != null) {
+                cb.onStep("体检完成 · 扫描 " + scanned + " 组 · 缺失 " + missing + " 根 / "
+                        + gaps + " 段" + (cleared > 0 ? " · 清空 " + cleared + " 组" : ""),
+                        step, totalSteps);
+            }
+            step++;
+
+            // ---------- 第 2 段：补齐（有缺口）或增量（无缺口） ----------
+            for (Job j : jobs) {
+                String name = Products.nameOf(j.code);
+                boolean heal = forceFull || j.missing > 0 || j.cleared;
+                if (cb != null) {
+                    cb.onStep((heal ? "补齐 " : "增量 ") + name + " " + labelOf(j.period)
+                            + (j.missing > 0 ? "（缺 " + j.missing + " 根）" : "") + "…",
+                            step, totalSteps);
+                }
+                JSONObject r = apply(j, forceFull);
+                JSONObject one = detail.optJSONObject(j.code);
+                if (one == null) {
+                    one = new JSONObject();
+                    detail.put(j.code, one);
+                }
+                one.put(j.period, r);
+                added += r.optInt("added", 0);
+                if (r.optBoolean("healed", false)) {
+                    healedItems++;
+                    healedBars += j.missing;
+                }
+                long cov = store.firstKlineTsSince(j.code, j.period, checkCut);
+                coverage.put(j.code + "|" + j.period, cov);
+                if (r.has("error")) {
+                    fail.append(name).append(labelOf(j.period))
+                            .append("[").append(r.optString("error")).append("] ");
+                }
+                step++;
+                Thread.sleep("1d".equals(j.period) ? 160 : 200);
+            }
+
+            // ---------- 第 3 段：秒级校验 + 刷新缓存 + 统计 ----------
+            if (cb != null) cb.onStep("校验秒级快照 · 刷新本地缓存…", totalSteps, totalSteps);
+            JSONObject ticks = checkTicks();
             reloadCaches();
             cfg.setLastSync(now);
+
             JSONObject periods = store.periodStats();
-            String msg = summary(periods, now, added);
+            JSONObject check = new JSONObject();
+            check.put("days", CHECK_DAYS);
+            check.put("scanned", scanned);
+            check.put("missing", missing);
+            check.put("gaps", gaps);
+            check.put("cleared", cleared);
+            check.put("healed_items", healedItems);
+            check.put("healed_bars", healedBars);
+            check.put("forced", forceFull);
+            check.put("incremental", added);
+
+            String base = summary(periods, now, added);
+            String head;
+            if (forceFull) head = "强制全量重写近 " + CHECK_DAYS + " 天 · ";
+            else if (missing > 0 || cleared > 0) {
+                head = "体检回补 " + healedBars + " 根 / " + healedItems + " 组 · ";
+            } else head = "体检无缺失 · ";
+            String msg = head + base;
+
+            long cov1m = minCoverage(coverage, "|1m");
+            String note = "秒级仅本机采集（最近 30 分钟 " + ticks.optInt("points", 0)
+                    + " 点），公开源不提供历史秒级，无法回溯补齐";
+            if (cov1m > 0) {
+                note += "；1 分钟线实际覆盖起点 " + dayStr(cov1m) + "（受源站 1023 根上限）";
+            }
+
             res.put("ok", true);
             res.put("fetched", added);
+            res.put("added", added);
+            res.put("healed_bars", healedBars);
+            res.put("healed_items", healedItems);
             res.put("periods", periods);
             res.put("detail", detail);
+            res.put("check", check);
+            res.put("ticks", ticks);
+            res.put("coverage", coverage);
+            res.put("note", note);
             res.put("message", msg);
             cfg.setLastSyncMsg(msg);
             if (fail.length() > 0) {
@@ -523,32 +624,80 @@ public class Engine {
         return res;
     }
 
-    /** 单个 品种×周期 的增量同步；异常写进返回值而不是抛给上层。 */
-    private JSONObject syncOne(String code, String period, long dailyCut) {
+    /** 一次体检/写入的工作单元：一个「品种 × 周期」。 */
+    private static final class Job {
+        final String code;
+        final String period;
+        List<Bar> bars = new ArrayList<>();   // 源站返回的全部 bar
+        List<Bar> window = new ArrayList<>(); // 落在最近 7 天内的 bar
+        int localWindow;                      // 本地近 7 天根数
+        int missing;                          // 空洞根数（不含正常尾部新增）
+        int gaps;                             // 空洞连成几段
+        int tail;                             // 本地最后一根之后的新 bar（正常增量）
+        boolean cleared;                      // 本地近 7 天为 0 而源站有数据
+        String error;
+
+        Job(String code, String period) {
+            this.code = code;
+            this.period = period;
+        }
+    }
+
+    /** 逐根比对源站与本地，算出「空洞」数（不含正常尾部新增）、缺口段数、是否整段被清空。 */
+    private void analyze(Job j, long checkCut) {
+        j.window = new ArrayList<>();
+        for (Bar b : j.bars) if (b.ts >= checkCut) j.window.add(b);
+        Set<Long> local = store.klineTsSet(j.code, j.period, checkCut);
+        j.localWindow = local.size();
+        j.cleared = j.localWindow == 0 && !j.window.isEmpty();
+        if (j.cleared) {
+            // 整段没了：全部按缺失算，一次整体写回
+            j.missing = j.window.size();
+            j.gaps = 1;
+            j.tail = 0;
+            return;
+        }
+        long localMax = 0;
+        for (Long t : local) if (t > localMax) localMax = t;
+        boolean inGap = false;
+        for (Bar b : j.window) {
+            if (local.contains(b.ts)) {
+                inGap = false;
+            } else if (localMax > 0 && b.ts > localMax) {
+                // 本地最后一根之后的新 bar：正常增量，不算缺口
+                j.tail++;
+            } else {
+                j.missing++;
+                if (!inGap) {
+                    j.gaps++;
+                    inGap = true;
+                }
+            }
+        }
+    }
+
+    /** 有空洞/清空就把近 7 天窗口整体 REPLACE 写回；只有尾部新增时按增量写。 */
+    private JSONObject apply(Job j, boolean forceFull) {
         JSONObject r = new JSONObject();
         try {
-            List<Bar> bars = "1d".equals(period)
-                    ? sina.daily(code)
-                    : sina.minute(code, SinaClient.typeOf(period));
-            if ("1d".equals(period)) {
-                List<Bar> recent = new ArrayList<>();
-                for (Bar b : bars) if (b.ts >= dailyCut) recent.add(b);
-                bars = recent;
-            }
-            long localMax = store.lastKlineTs(code, period);
-            int before = store.countKline(code, period);
-            int incoming = 0;
-            if (!bars.isEmpty()) {
-                List<Bar> add = new ArrayList<>();
-                for (Bar b : bars) if (localMax <= 0 || b.ts >= localMax) add.add(b);
-                incoming = add.size();
-                if (incoming > 0) store.upsertKlines(code, period, add);
-            }
-            int after = store.countKline(code, period);
+            int before = store.countKline(j.code, j.period);
+            long localMax = store.lastKlineTs(j.code, j.period);
+            boolean heal = forceFull || j.missing > 0 || j.cleared;
+            List<Bar> write;
+            if (heal) write = j.window.isEmpty() ? j.bars : j.window;
+            else write = tail(j.bars, localMax);
+            if (!write.isEmpty()) store.upsertKlines(j.code, j.period, write);
+            int after = store.countKline(j.code, j.period);
             r.put("added", Math.max(0, after - before));
             r.put("total", after);
-            r.put("fetched", bars.size());
-            r.put("incoming", incoming);
+            r.put("fetched", j.bars.size());
+            r.put("written", write.size());
+            r.put("local_window", j.localWindow);
+            r.put("tail", j.tail);
+            r.put("missing", j.missing);
+            r.put("gaps", j.gaps);
+            r.put("cleared", j.cleared);
+            r.put("healed", heal);
             if (after <= 0) r.put("error", "返回 0 根");
         } catch (Exception e) {
             try {
@@ -558,6 +707,69 @@ public class Engine {
             }
         }
         return r;
+    }
+
+    /** 秒级体检：统计最近 30 分钟点数；最新点太旧就立刻补一次实时报价。 */
+    private JSONObject checkTicks() {
+        JSONObject o = new JSONObject();
+        long now = System.currentTimeMillis();
+        long since = now - TICK_WINDOW_MS;
+        try {
+            int pts = 0;
+            long newest = 0;
+            for (String code : Products.CODES) {
+                pts += store.countTicksSince(code, since);
+                newest = Math.max(newest, store.lastTickTs(code));
+            }
+            long staleMs = Math.max(180_000L, cfg.refreshSec() * 2000L);
+            boolean refilled = false;
+            if (newest == 0 || now - newest > staleMs) {
+                Map<String, SinaClient.Quote> q = sina.realtime();
+                for (SinaClient.Quote v : q.values()) {
+                    quotes.put(v.code, v);
+                    store.saveTick(v.code, v.ts, v.last, v.bid, v.ask, v.volume, v.oi);
+                    newest = Math.max(newest, v.ts);
+                }
+                refilled = !q.isEmpty();
+            }
+            o.put("points", pts);
+            o.put("newest", newest);
+            o.put("age_sec", newest > 0 ? Math.max(0, (now - newest) / 1000) : -1);
+            o.put("refilled", refilled);
+        } catch (Exception e) {
+            try {
+                o.put("points", 0);
+                o.put("error", brief(e));
+            } catch (Exception ignored) {
+            }
+        }
+        return o;
+    }
+
+    /** 只保留 ts >= cut 的部分。 */
+    private static List<Bar> within(List<Bar> bars, long cut) {
+        List<Bar> out = new ArrayList<>();
+        if (bars == null) return out;
+        for (Bar b : bars) if (b.ts >= cut) out.add(b);
+        return out;
+    }
+
+    /** 从 coverage 里取某个周期的多品种最早覆盖时间（key 形如 "AL|1m"）。 */
+    private static long minCoverage(JSONObject coverage, String suffix) {
+        long min = 0;
+        java.util.Iterator<String> it = coverage.keys();
+        while (it.hasNext()) {
+            String k = it.next();
+            if (!k.endsWith(suffix)) continue;
+            long v = coverage.optLong(k, 0);
+            if (v > 0 && (min == 0 || v < min)) min = v;
+        }
+        return min;
+    }
+
+    private static String dayStr(long ts) {
+        return new java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA)
+                .format(new java.util.Date(ts));
     }
 
     /** 各品种要同步的周期；伦铝（外盘）只有日线与 1 分钟分时。 */

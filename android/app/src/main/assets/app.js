@@ -777,7 +777,8 @@
       if (info && info.getAttribute('data-busy') !== '1') {
         info.textContent = (S.state.last_sync ? '上次同步 ' + timeStr(S.state.last_sync) : '尚未同步')
           + (S.state.last_sync_msg ? '：' + S.state.last_sync_msg : '')
-          + '。源站每周期最多 1023 根（60 分钟线约 195 天），重复同步只补增量。';
+          + '。每次同步先体检最近 7 天（缺失或整段清空自动回补），无缺口才只补增量再顺延到最新。'
+          + (S.syncNote ? '\n' + S.syncNote : '');
       }
     }
   }
@@ -846,7 +847,7 @@
     var s = {};
     try {
       s = JSON.parse(DEMO
-        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.3.0"}'
+        ? '{"refresh_sec":30,"llm_base":"https://api.deepseek.com/v1","llm_model":"deepseek-chat","has_llm_key":false,"theme":"dark","version":"2.4.0"}'
         : N.settings());
     } catch (e) { s = {}; }
     S.settings = s;
@@ -1015,7 +1016,26 @@
     if (wrap) wrap.hidden = true;
   }
 
+  /** 更新进度条的失败态：保留已下到的位置，右侧百分比改写成「失败」。 */
+  function progFail(pct, text) {
+    progSet('#updProgWrap', pct || 0, text, 'fail');
+    var el = $('#updProgPct');
+    if (el) el.textContent = '失败';
+  }
+
   function mb(b) { return ((b || 0) / 1048576).toFixed(1); }
+
+  function speedStr(bps) {
+    if (!bps || bps <= 0) return '';
+    return bps >= 1048576
+      ? (bps / 1048576).toFixed(1) + ' MB/s'
+      : Math.max(1, Math.round(bps / 1024)) + ' KB/s';
+  }
+
+  function secStr(s) {
+    var v = Math.max(1, Math.round(s));
+    return v >= 60 ? Math.floor(v / 60) + ' 分 ' + (v % 60) + ' 秒' : v + ' 秒';
+  }
 
   function onSyncStep(msg) {
     var text, pct = 0, hasTotal = false;
@@ -1046,12 +1066,30 @@
       toast(m);
       return;
     }
-    progSet('#syncProgWrap', 100, '同步完成 · 新增 ' + (res.fetched || 0) + ' 根', 'done');
+    var c = res.check || {};
+    var t = res.ticks || {};
+    var head = '体检 ' + (c.scanned || 0) + ' 组';
+    if (c.forced) {
+      head += ' · 强制全量重写';
+    } else if ((c.missing || 0) > 0 || (c.cleared || 0) > 0) {
+      head += ' · 回补 ' + (c.healed_bars || 0) + ' 根 / ' + (c.healed_items || 0) + ' 组';
+      if ((c.cleared || 0) > 0) head += '（清空 ' + c.cleared + ' 组）';
+    } else {
+      head += ' · 无缺失';
+    }
+    var tickTxt = '秒级 ' + (t.points || 0) + ' 点';
+    if (t.age_sec >= 0) tickTxt += '（最新 ' + t.age_sec + ' 秒前' + (t.refilled ? '，已补当前点' : '') + '）';
+
+    progSet('#syncProgWrap', 100,
+      '同步完成 · 新增 ' + (res.fetched || 0) + ' 根'
+      + ((c.healed_bars || 0) > 0 ? ' · 回补 ' + c.healed_bars + ' 根' : ''), 'done');
+    S.syncNote = res.note || '';
     if (info) {
-      info.textContent = '同步完成：' + res.message
+      info.textContent = '同步完成：' + head + ' · ' + tickTxt
+        + (res.note ? '\n' + res.note : '')
         + (res.warn ? '\n' + res.warn : '');
     }
-    toast('同步完成：' + res.message);
+    toast('同步完成：' + head);
     pull();
   }
 
@@ -1098,35 +1136,84 @@
     info.textContent = txt;
   }
 
+  /**
+   * 检查更新：从点击起进度条就在场上。
+   * 查询发行版阶段为不确定态，读到 release 信息后转为确定进度（由 native 的 check 阶段回调驱动），
+   * 检查结束不隐藏进度条——有新版直接续成下载进度，无新版落成灰色完成态。
+   */
   function checkUpdate() {
     var info = $('#updInfo');
-    info.textContent = '正在检查…';
-    $('#btnUpdateInstall').disabled = true;
-    progHide('#updProgWrap');
+    var btn = $('#btnUpdateInstall');
+    S.upd = { phase: 'check' };
+    info.textContent = '正在检查更新（Gitee 首要源）…';
+    if (btn) { btn.disabled = true; btn.textContent = '立即更新'; }
+    progSet('#updProgWrap', 0, '正在读取 Gitee 发行版信息…', 'indet');
     if (DEMO) {
-      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.0.0（演示）' });
+      onUpdate({ ok: true, has_update: false, message: '已是最新版本 v2.4.0（演示）' });
       return;
     }
-    try { N.checkUpdate(); } catch (e) { info.textContent = '检查失败：' + e.message; }
+    try { N.checkUpdate(); } catch (e) {
+      S.upd = { phase: 'fail' };
+      progFail(0, '检查失败：' + e.message);
+      if (btn) { btn.disabled = false; btn.textContent = '重试检查'; }
+    }
+  }
+
+  function startDownload(o) {
+    var btn = $('#btnUpdateInstall');
+    if (DEMO) { toast('演示模式不支持安装'); return; }
+    S.upd = { phase: 'downloading' };
+    S.updT0 = Date.now();
+    progSet('#updProgWrap', 0, o.size > 0 ? '正在连接，共 ' + mb(o.size) + ' MB…' : '正在连接…', 'indet');
+    if (btn) { btn.disabled = true; btn.textContent = '下载中…'; }
+    try {
+      N.installUpdate(o.apk_url, o.version, o.size || 0);
+    } catch (e) {
+      onUpdateProgress({ phase: 'error' });
+      toast('下载失败：' + e.message);
+    }
   }
 
   function onUpdateProgress(o) {
     if (!o) return;
     var btn = $('#btnUpdateInstall');
+    if (o.phase === 'check') {
+      // pct=0 表示还在读发行版（不确定态），之后是解析附件/安装包的确定进度
+      progSet('#updProgWrap', o.pct || 0, o.msg || '正在检查更新…',
+        (o.pct || 0) > 0 ? '' : 'indet');
+      return;
+    }
     if (o.phase === 'error') {
-      progSet('#updProgWrap', 0, '下载失败，可重新点「重试更新」', 'fail');
+      S.upd = { phase: 'fail' };
+      progFail(S.updPct || 0, '下载失败，可点「重试更新」直接再试，无需重新检查');
       if (btn) { btn.disabled = false; btn.textContent = '重试更新'; }
       return;
     }
     if (o.phase === 'done') {
-      progSet('#updProgWrap', 100, '下载完成，正在调起系统安装…', 'done');
+      S.upd = { phase: 'done' };
+      progSet('#updProgWrap', 100, '下载完成，正在调起系统安装器…', 'done');
       if (btn) { btn.disabled = true; btn.textContent = '下载完成'; }
       return;
     }
+    if (o.phase === 'start' || !o.done) {
+      S.upd = { phase: 'connecting' };
+      S.updT0 = Date.now();
+      progSet('#updProgWrap', 0,
+        o.total > 0 ? '正在连接，共 ' + mb(o.total) + ' MB…' : '正在连接…', 'indet');
+      if (btn) { btn.disabled = true; btn.textContent = '下载中…'; }
+      return;
+    }
     var known = o.total > 0;
-    var txt = known
-      ? '下载中 ' + mb(o.done) + ' / ' + mb(o.total) + ' MB'
-      : '下载中 ' + mb(o.done) + ' MB';
+    var txt = '下载中 ' + mb(o.done) + (known ? ' / ' + mb(o.total) : '') + ' MB';
+    var sec = S.updT0 ? (Date.now() - S.updT0) / 1000 : 0;
+    if (known && sec >= 1 && o.done > 0) {
+      var speed = o.done / sec;
+      txt += ' · ' + speedStr(speed);
+      var left = (o.total - o.done) / speed;
+      if (left > 0 && left < 3600) txt += ' · 剩余 ' + secStr(left);
+    }
+    S.upd = { phase: 'downloading' };
+    S.updPct = o.pct || 0;
     progSet('#updProgWrap', o.pct || 0, txt, known ? '' : 'indet');
     if (btn) {
       btn.disabled = true;
@@ -1137,16 +1224,36 @@
   function onUpdate(o) {
     S.update = o;
     var info = $('#updInfo');
-    if (!o) { info.textContent = '检查失败'; return; }
-    if (!o.ok) { info.textContent = o.message || '检查失败'; return; }
+    var btn = $('#btnUpdateInstall');
+    if (!o) {
+      S.upd = { phase: 'fail' };
+      if (info) info.textContent = '检查失败：没有返回结果';
+      progFail(0, '检查失败：没有返回结果');
+      if (btn) { btn.disabled = false; btn.textContent = '重试检查'; }
+      return;
+    }
+    if (!o.ok) {
+      S.upd = { phase: 'fail' };
+      if (info) info.textContent = o.message || '检查失败';
+      progFail(0, o.message || '检查失败');
+      if (btn) { btn.disabled = false; btn.textContent = '重试检查'; }
+      return;
+    }
     if (o.has_update) {
       var src = o.source === 'gitee' ? 'Gitee' : (o.source || 'Gitee');
-      info.textContent = '发现新版本 ' + o.version + '（' + (o.size ? Math.round(o.size / 1048576 * 10) / 10 + ' MB · ' : '') + src + '）\n'
-        + (o.notes || '');
-      $('#btnUpdateInstall').disabled = false;
+      if (info) {
+        info.textContent = '发现新版本 ' + o.version + '（'
+          + (o.size ? Math.round(o.size / 1048576 * 10) / 10 + ' MB · ' : '') + src + '）\n'
+          + (o.notes || '');
+      }
+      S.upd = { phase: 'ready' };
+      progSet('#updProgWrap', 0, '发现新版本 ' + o.version + ' · 点「立即更新」开始下载', 'idle');
+      if (btn) { btn.disabled = false; btn.textContent = '立即更新'; }
     } else {
-      info.textContent = o.message || '已是最新版本';
-      $('#btnUpdateInstall').disabled = true;
+      S.upd = { phase: 'latest' };
+      if (info) info.textContent = o.message || '已是最新版本';
+      progSet('#updProgWrap', 100, o.message || '已是最新版本', 'idle');
+      if (btn) { btn.disabled = true; btn.textContent = '已是最新'; }
     }
   }
 
@@ -1324,35 +1431,36 @@
       if (v) { saveSettings({ gitee_token: v }); this.value = ''; }
     });
     $('#btnUpdateCheck').addEventListener('click', checkUpdate);
+    // 一键续跑：检查失败 → 重试检查；下载失败 → 直接重下（不用先重新检查）
     $('#btnUpdateInstall').addEventListener('click', function () {
       var o = S.update;
+      var phase = (S.upd && S.upd.phase) || '';
+      if (phase === 'fail' && (!o || !o.has_update)) { checkUpdate(); return; }
       if (!o || !o.has_update) return;
-      if (DEMO) { toast('演示模式不支持安装'); return; }
-      progSet('#updProgWrap', 0, o.size > 0 ? '正在连接，共 ' + mb(o.size) + ' MB…' : '正在连接…', 'indet');
-      this.disabled = true;
-      this.textContent = '下载中…';
-      try {
-        N.installUpdate(o.apk_url, o.version, o.size || 0);
-      } catch (e) {
-        onUpdateProgress({ phase: 'error' });
-        toast('下载失败：' + e.message);
-      }
+      startDownload(o);
     });
-    // 同步历史数据（最近 180 天）
+    // 同步历史数据：先体检最近 7 天，再补齐 / 增量
     $('#btnSyncHistory').addEventListener('click', function () {
       if (DEMO) { toast('演示模式不支持同步'); return; }
       var b = this;
+      var forceEl = $('#chkForceResync');
+      var force = !!(forceEl && forceEl.checked);
       b.disabled = true;
       b.textContent = '同步中…';
+      S.syncNote = '';
       var info = $('#syncInfo');
       if (info) {
         info.setAttribute('data-busy', '1');
-        info.textContent = '正在与官方源做增量同步，进度见上方进度条；中途请勿退出应用。';
+        info.textContent = '正在与官方源比对最近 7 天的完整性，进度见上方进度条；中途请勿退出应用。';
       }
-      progSet('#syncProgWrap', 0, '正在连接数据源…', 'indet');
-      try { N.syncHistory(); } catch (e) {
+      progSet('#syncProgWrap', 0, force ? '强制全量重写近 7 天…' : '正在体检最近 7 天数据…', 'indet');
+      try {
+        if (force && N.syncHistoryForce) N.syncHistoryForce(true);
+        else N.syncHistory();
+      } catch (e) {
         b.disabled = false;
         b.textContent = '同步历史数据';
+        progSet('#syncProgWrap', 0, '同步失败：' + e.message, 'fail');
         toast('同步失败：' + e.message);
       }
     });

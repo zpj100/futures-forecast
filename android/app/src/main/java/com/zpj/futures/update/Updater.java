@@ -73,7 +73,19 @@ public class Updater {
 
     // ---------------- 检查更新 ----------------
 
+    /**
+     * 检查阶段回调（v2.4.0）：让界面的进度条从「不确定」平滑过渡到「确定」。
+     * pct<=0 表示仍处在不确定阶段（还没读到发行版信息）。
+     */
+    public interface Stage {
+        void onStage(String msg, int pct);
+    }
+
     public Info check() {
+        return check(null);
+    }
+
+    public Info check(Stage st) {
         Info info = new Info();
         String token = cfg.giteeToken();
         if (token.isEmpty()) {
@@ -81,17 +93,23 @@ public class Updater {
             return info;
         }
         try {
+            if (st != null) st.onStage("正在读取 Gitee 发行版信息…", 0);
             JSONObject rel = new JSONObject(apiGet("releases/latest", token));
             info.version = rel.optString("tag_name", rel.optString("name", ""));
             info.versionCode = versionCode(info.version, rel.optString("body", ""));
             info.notes = rel.optString("body", "");
+            if (st != null) st.onStage("已找到发行版 " + trimMsg(info.version) + "，正在解析安装包…", 55);
 
             long releaseId = rel.optLong("id", 0);
             if (releaseId > 0) resolveAsset(info, releaseId, token);
             if (info.apkUrl.isEmpty()) resolveAssetFallback(info, rel);
+            if (st != null) {
+                st.onStage(info.apkUrl.isEmpty() ? "未找到安装包附件" : "安装包信息已就绪，正在比对版本…", 85);
+            }
 
             info.ok = true;
             info.hasUpdate = info.versionCode > BuildConfig.VERSION_CODE && !info.apkUrl.isEmpty();
+            if (st != null) st.onStage(info.hasUpdate ? "发现新版本 " + info.version : "已是最新版本", 100);
             if (!info.hasUpdate) {
                 info.message = info.apkUrl.isEmpty()
                         ? "最新发行版 " + info.version + " 未找到安装包附件"
