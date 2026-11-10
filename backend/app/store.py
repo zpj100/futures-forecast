@@ -95,6 +95,23 @@ def _init_schema(c: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_kapp_code_period_ts
             ON kline_app(code, period, ts);
+
+        -- 预测历史日志：每轮把七档量化预测快照落库，供命中率统计。
+        -- dir: +1 上涨 / -1 下跌 / 0 震荡或数据不足；主键 (code,ts,horizon) 幂等。
+        CREATE TABLE IF NOT EXISTS forecast_log (
+            code      TEXT NOT NULL,
+            ts        INTEGER NOT NULL,   -- epoch milliseconds（预测时刻）
+            horizon  TEXT NOT NULL,      -- 1m/5m/15m/30m/60m/1d
+            hmin     INTEGER NOT NULL,   -- 该档分钟数
+            dir      INTEGER NOT NULL,
+            score    REAL,
+            price    REAL,               -- 预测时刻收盘价
+            PRIMARY KEY (code, ts, horizon)
+        );
+        CREATE INDEX IF NOT EXISTS idx_flog_code_ts
+            ON forecast_log(code, ts);
+        CREATE INDEX IF NOT EXISTS idx_flog_code_h
+            ON forecast_log(code, horizon, ts);
         """
     )
     c.commit()
@@ -206,6 +223,34 @@ def minute_count(code: str) -> int:
         c = _connect()
         return int(c.execute(
             "SELECT COUNT(*) FROM kline_min WHERE code=?", (code,)).fetchone()[0])
+
+
+def _ms_to_str(ms: int) -> str:
+    """毫秒 epoch → "YYYY-MM-DD HH:MM:SS"（CST），供 kline_min 字符串 ts 比较。"""
+    return datetime.fromtimestamp(ms / 1000, CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def minute_latest_ts(code: str) -> int:
+    """该品种 kline_min 最新 bar 的毫秒 epoch；空表返回 0。"""
+    with _lock:
+        c = _connect()
+        r = c.execute(
+            "SELECT MAX(ts) FROM kline_min WHERE code=?", (code,)).fetchone()
+    return int(bar_ts_ms(r[0])) if r and r[0] is not None else 0
+
+
+def minute_count_in_range(code: str, start_ms: int, end_ms: int) -> int:
+    """统计 [start_ms, end_ms]（闭区间，毫秒）内已有 1m K 线根数。
+
+    kline_min.ts 为 "YYYY-MM-DD HH:MM:SS" 文本，该格式零填充、字典序即时间序，
+    可直接用字符串比较做范围过滤，无需逐行解析。
+    """
+    with _lock:
+        c = _connect()
+        return int(c.execute(
+            "SELECT COUNT(*) FROM kline_min WHERE code=? AND ts>=? AND ts<=?",
+            (code, _ms_to_str(start_ms), _ms_to_str(end_ms)),
+        ).fetchone()[0])
 
 
 def daily_count(code: str) -> int:
@@ -488,6 +533,72 @@ def snapshot_ohlc(code: str, limit: int = 4500) -> list[dict]:
             "v": s.get("volume") or 0.0,
         })
     return out
+
+
+# ------------------------------------------------------------- forecast_log
+# 预测历史日志：每轮七档量化预测落库，供 /api/history 命中率统计。
+
+_DIR_MAP = {"上涨": 1, "下跌": -1}  # 其余（震荡 / 数据不足）记 0
+
+
+def dir_to_int(direction: str) -> int:
+    return _DIR_MAP.get(direction, 0)
+
+
+def log_forecast(code: str, ts_ms: int, horizon: str, hmin: int,
+                 direction: str, score: float | None,
+                 price: float | None) -> None:
+    """幂等写入一条预测记录（主键 code,ts,horizon）。"""
+    with _lock:
+        c = _connect()
+        c.execute(
+            "INSERT OR REPLACE INTO forecast_log"
+            "(code,ts,horizon,hmin,dir,score,price) VALUES(?,?,?,?,?,?,?)",
+            (code, int(ts_ms), horizon, int(hmin), dir_to_int(direction),
+             score, price),
+        )
+        c.commit()
+
+
+def forecast_log_since(code: str, horizon: str, since_ms: int) -> list[dict]:
+    """取该 (code,horizon) 自 since_ms 起的预测记录，按 ts 升序。"""
+    with _lock:
+        c = _connect()
+        rows = c.execute(
+            "SELECT ts,dir,score,price FROM forecast_log"
+            " WHERE code=? AND horizon=? AND ts>=? ORDER BY ts ASC",
+            (code, horizon, int(since_ms)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def truncate_forecast_log(keep_ms: int) -> None:
+    """删除 keep_ms 之前的全量预测日志，限制表无限增长（默认保留 90 天）。"""
+    with _lock:
+        c = _connect()
+        c.execute("DELETE FROM forecast_log WHERE ts < ?", (int(keep_ms),))
+        c.commit()
+
+
+def price_at_or_after(code: str, ts_ms: int) -> float | None:
+    """返回该品种在 ts_ms 或之后第一根 bar 的收盘价；用于命中率的实际涨跌判定。
+
+    优先 1m（覆盖约 1023 分钟，足以覆盖 4h/8h 档）；1m 查不到（如 1d 档落在未来日线）
+    再退回日线。无数据返回 None。
+    """
+    with _lock:
+        c = _connect()
+        r = c.execute(
+            "SELECT c FROM kline_min WHERE code=? AND ts>=? ORDER BY ts ASC LIMIT 1",
+            (code, _ms_to_str(ts_ms))).fetchone()
+        if r and r[0] is not None:
+            return float(r[0])
+        r = c.execute(
+            "SELECT c FROM kline_day WHERE code=? AND ts>=? ORDER BY ts ASC LIMIT 1",
+            (code, _ms_to_str(ts_ms))).fetchone()
+        if r and r[0] is not None:
+            return float(r[0])
+    return None
 
 
 # ------------------------------------------------------------- kline_app

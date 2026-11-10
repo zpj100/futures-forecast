@@ -1,106 +1,164 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>铝期货趋势预测 · 电解铝 / 氧化铝 / 伦铝</title>
-<meta name="theme-color" content="#06080d">
-<link rel="stylesheet" href="/styles.css">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#05070C" id="themeColor" />
+  <title>期货趋势预测 · 服务端</title>
+  <link rel="stylesheet" href="/styles.css" />
 </head>
-<body>
-<a class="skip" href="#main">跳到主要内容</a>
-
-<header class="topbar">
-  <div class="brand">
-    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M3 17l5-6 4 3 4-7 5 5" fill="none" stroke="currentColor"
-            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      <path d="M3 21h18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-    </svg>
-    <div>
-      <h1>铝期货趋势预测</h1>
-      <p class="sub">电解铝 · 氧化铝 · 伦铝　六周期量化预测</p>
+<body class="theme-dark">
+  <header class="topbar">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M3 17l5-6 4 4 5-8 4 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <span class="brand-name">期货趋势预测</span>
+      <span id="brandVer" class="brand-ver">v2.7</span>
     </div>
-  </div>
-  <div class="status" role="status" aria-live="polite">
-    <span id="connDot" class="dot offline"></span>
-    <span id="connText">连接中…</span>
-    <span id="clock" class="clock">--:--:--</span>
-  </div>
-</header>
-
-<main id="main">
-
-  <section class="cards" id="quoteCards" aria-label="品种实时行情">
-  </section>
-
-  <section class="panel chart-panel">
-    <div class="panel-head">
-      <div class="tabs" id="prodTabs" role="tablist" aria-label="品种切换"></div>
-      <div class="seg" id="periodSeg" role="group" aria-label="K线周期">
-        <button data-period="1m" class="on">1分</button>
-        <button data-period="5m">5分</button>
-        <button data-period="15m">15分</button>
-        <button data-period="60m">1时</button>
-        <button data-period="1d">日线</button>
-      </div>
+    <div class="status">
+      <span id="connDot" class="dot offline"></span>
+      <span id="connText">连接中…</span>
+      <span id="clock" class="clock">--:--:--</span>
     </div>
-    <div class="chart-wrap">
-      <canvas id="mainChart" role="img" aria-label="价格走势图"></canvas>
-      <div id="chartTip" class="chart-tip" hidden></div>
-    </div>
-    <div class="chart-foot">
-      <span id="chartRange" class="muted">—</span>
-      <span id="chartLegend" class="legend"></span>
-    </div>
-  </section>
+  </header>
 
-  <section class="panel">
-    <div class="panel-head">
-      <h2>趋势预测 <span class="muted sm">六周期 · 走向外验证</span></h2>
-      <div class="seg" id="fcProdSeg" role="group" aria-label="预测品种"></div>
-    </div>
-    <div class="horizons" id="horizons"></div>
-  </section>
+  <nav class="tabs" id="topTabs">
+    <button class="tab on" data-tab="market">行情</button>
+    <button class="tab" data-tab="forecast">预测</button>
+    <button class="tab" data-tab="history">历史</button>
+    <button class="tab" data-tab="settings">设置</button>
+  </nav>
 
-  <div class="duo">
-    <section class="panel">
-      <div class="panel-head"><h2>量化指标</h2></div>
-      <div class="ind-grid" id="indicators"></div>
-      <div class="rec" id="recommendation"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2>资讯</h2>
-        <div class="seg" id="newsSeg" role="group" aria-label="资讯筛选">
-          <button data-code="" class="on">全部</button>
-          <button data-code="AL">电解铝</button>
-          <button data-code="AO">氧化铝</button>
-          <button data-code="AHD">伦铝</button>
+  <main id="main">
+    <!-- ===================== 行情 ===================== -->
+    <section class="view active" id="v-market">
+      <div class="cards" id="quoteCards" aria-label="品种实时行情"></div>
+      <div class="panel chart-panel">
+        <div class="panel-head">
+          <div class="tabs sm" id="prodTabs" role="tablist" aria-label="品种切换"></div>
+          <label class="chk sm"><input type="checkbox" id="compareChk" /><span>三品种对比</span></label>
+        </div>
+        <div class="seg" id="periodSeg" role="group" aria-label="K线周期">
+          <button data-period="1s">1秒</button>
+          <button data-period="30s">30秒</button>
+          <button data-period="1m" class="on">1分</button>
+          <button data-period="5m">5分</button>
+          <button data-period="15m">15分</button>
+          <button data-period="30m">30分</button>
+          <button data-period="60m">1时</button>
+          <button data-period="1d">日线</button>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="mainChart" role="img" aria-label="价格走势图"></canvas>
+          <div id="chartTip" class="chart-tip" hidden></div>
+        </div>
+        <div class="chart-foot">
+          <span id="chartRange" class="muted">—</span>
+          <span id="chartLegend" class="legend"></span>
         </div>
       </div>
-      <div class="news" id="news"></div>
+      <div class="panel">
+        <div class="panel-head"><h2>技术指标</h2></div>
+        <div class="ind-grid" id="indicators"></div>
+        <div class="rec" id="recommendation"></div>
+      </div>
     </section>
-  </div>
 
-  <section class="panel data-panel">
-    <div class="panel-head"><h2>数据说明</h2></div>
-    <div class="data-grid" id="dataMeta"></div>
-    <p class="muted sm note">
-      公开接口能提供的最细历史粒度为 1 分钟（沪铝/氧化铝约 3 个交易日，伦铝当日）。
-      服务启动后每 3 秒抓取一次实时快照并本地累积，秒级历史随运行时长增长；
-      日线历史可回溯多年，用于 8 小时与 1 天周期的建模。
-    </p>
-  </section>
+    <!-- ===================== 预测 ===================== -->
+    <section class="view" id="v-forecast">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>七周期方向（量化模型）</h2>
+          <div class="seg sm" id="fcProdSeg" role="group" aria-label="预测品种"></div>
+        </div>
+        <div class="horizons" id="horizons"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>大模型多周期趋势</h2>
+          <button id="btnLlm" class="btn ghost">生成分析</button>
+        </div>
+        <div id="llmBox" class="llm">点击「生成分析」调用服务端已配置的模型（设置页填写 Key）。</div>
+      </div>
+    </section>
 
-</main>
+    <!-- ===================== 历史 ===================== -->
+    <section class="view" id="v-history">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>预测命中率统计</h2>
+          <div class="seg sm" id="histCodeSeg" role="group" aria-label="统计品种"></div>
+        </div>
+        <div class="hist-meta muted sm" id="histMeta">—</div>
+        <table class="hist-table" id="histTable">
+          <thead>
+            <tr><th>周期</th><th>样本</th><th>命中</th><th>命中率</th><th>方向说明</th></tr>
+          </thead>
+          <tbody id="histBody"></tbody>
+        </table>
+        <p class="muted sm">命中率 = 预测方向（涨/跌）与后续实际涨跌一致的比例；「震荡/数据不足」不计入样本。窗口默认 30 天。</p>
+      </div>
+    </section>
 
-<footer class="foot">
-  <span>数据来源：新浪财经公开行情 · 东方财富 / 同花顺公开资讯</span>
-  <span class="muted">量化统计结果，不构成投资建议</span>
-</footer>
+    <!-- ===================== 设置 ===================== -->
+    <section class="view" id="v-settings">
+      <div class="panel">
+        <div class="panel-head"><h2>界面风格</h2></div>
+        <div class="seg" id="themeSeg" role="group" aria-label="主题">
+          <button data-theme="dark" class="on">深色</button>
+          <button data-theme="light">浅色</button>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>数据刷新</h2></div>
+        <div class="seg" id="refreshSeg" role="group" aria-label="刷新间隔">
+          <button data-ms="5000">5秒</button>
+          <button data-ms="15000" class="on">15秒</button>
+          <button data-ms="30000">30秒</button>
+          <button data-ms="60000">60秒</button>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>大模型（服务端）</h2></div>
+        <div class="field">
+          <label class="field-label">API Base</label>
+          <input id="llmBase" class="input" placeholder="https://api.deepseek.com/v1" autocapitalize="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label class="field-label">模型名</label>
+          <input id="llmModel" class="input" placeholder="deepseek-chat" autocapitalize="off" spellcheck="false" />
+        </div>
+        <div class="field">
+          <label class="field-label">API Key <span id="llmMask" class="muted"></span></label>
+          <input id="llmKey" class="input" type="password" placeholder="留空表示不修改" autocapitalize="off" spellcheck="false" />
+        </div>
+        <div class="row">
+          <button class="btn ghost" id="btnLlmClear">清除 Key</button>
+          <button class="btn" id="btnLlmSave">保存</button>
+        </div>
+        <p class="muted sm">Key 仅存于服务端 data/llm.json，不入库、不进 git；浏览器只收到分析文本。</p>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>数据库与启动自检</h2>
+          <button id="btnAutofill" class="btn ghost">一键启动补全</button>
+        </div>
+        <div class="db-block" id="dbStatus">加载中…</div>
+        <div class="db-block" id="autofillStatus">加载中…</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>本地数据覆盖</h2></div>
+        <div class="data-grid" id="dataMeta"></div>
+      </div>
+      <div class="panel about">
+        <div class="about-row"><span>服务端版本</span><b id="aboutVer">—</b></div>
+        <div class="about-row"><span>数据口径</span><b>自然时间桶起点（毫秒）</b></div>
+      </div>
+    </section>
+  </main>
 
-<script src="/app.js"></script>
+  <div class="toast" id="toast"></div>
+  <script src="/app.js"></script>
 </body>
 </html>

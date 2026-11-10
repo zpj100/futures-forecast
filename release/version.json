@@ -1,7 +1,7 @@
 {
-  "version": "2.6.0",
-  "versionCode": 260,
+  "version": "2.7.0",
+  "versionCode": 270,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.6.0：① 修复「同步历史数据」显示无缺失/新增 0 根——回补基准从 7 天窗口扩展到源站整段序列，5m/15m/30m/60m 补到源站可给最长历史（1m 仍 1023 根上限、1d 回溯 180 天），1m 空洞如实标注不伪造；首次启动自动清理旧版本双时间戳残留行（自然桶派生 vs 源站段末）。② 设置页新增「数据库同步」区块：一键诊断每周期根数/首末时间/残留、与服务端双向增量同步（下拉服务端→手机、上推手机→服务端）分批≤300 根、失败批续跑、幂等，含进度条与本地/服务端对照；「重建本地数据库」二次确认后从预置库重导。③ WSL 服务端新增 /api/db/{status,export,import}（独立分表 kline_app，不影响既有接口），提供 run-lan.sh（0.0.0.0 监听）+ Windows netsh 端口转发与防火墙规则，手机填 http://<电脑局域网IP>:8000 即可。"
+  "notes": "v2.7.0：服务端化与启动自检（端口 8123）。① 服务端成为唯一真源：将 App 核心能力（行情/预测/历史/设置）搬至 Web 前端（backend/app/static 四 tab 全覆盖），Android 端保留为独立 App 并默认指向 8123；后端时间序列统一毫秒整数、自然时间桶口径。② 启动自检补全：新增交易日历（backend/app/calendar.py，日盘 9:00–15:00 含 10:15–10:30、11:30–13:30 休市子窗口，夜盘 21:00–次日 01:00 跨午夜、跳过周末）与 autofill 模块（backend/app/autofill.py），服务启动时按交易日历逐段比对 1m 覆盖率，窗口内缺失自动回补、窗口外（Sina 1m 固定 1023 根物理不可补）如实标注，不阻塞 API 启动。③ 服务端大模型：新增 /api/llm/config（GET/POST，密钥存 DATA_DIR/llm.json 并 chmod 600，绝不入仓/库）与 /api/llm/analyze，复用七档预测生成趋势研判。④ 预测命中率历史：collector 每轮把七档预测落库 forecast_log（主键幂等），新增 /api/history 按 horizon 统计命中率（对应周期到期后有实际价可比对，短周期数分钟内即可出数）。⑤ 端口 8123：run.sh 默认 8123，run-lan.sh 同步示例改 8123；Android 端默认 server.base/db.base 与帮助文案改为 8123。"
 }

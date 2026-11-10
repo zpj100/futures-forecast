@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 
 from . import store
-from .config import (KLINE_INTERVAL, NEWS_INTERVAL, PRODUCT_BY_CODE,
+from .config import (APP_HORIZONS, KLINE_INTERVAL, NEWS_INTERVAL, PRODUCT_BY_CODE,
                      SNAPSHOT_INTERVAL)
 from .datasource import news, sina
 from .datasource.sina import _drop_future
@@ -73,6 +73,16 @@ def _report(context: str, exc: BaseException) -> None:
     _err(f"{context}: {_brief(exc)}")
 
 
+def _log_forecast(code: str, fc: dict) -> None:
+    """把七档预测快照幂等写入 forecast_log，供 /api/history 命中率统计。"""
+    if not fc or "horizons" not in fc:
+        return
+    ts = int(time.time() * 1000)
+    for h in fc["horizons"]:
+        store.log_forecast(code, ts, h.get("key"), h.get("minutes", 0),
+                          h.get("direction"), h.get("score"), h.get("price"))
+
+
 async def tick_snapshots() -> None:
     """Capture a realtime quote snapshot every few seconds per product."""
     while True:
@@ -123,7 +133,11 @@ async def tick_klines() -> None:
                     store.sync_multi_incremental(code, mm)
                 # CPU 密集建模放线程，避免阻塞事件循环导致 WS/API 停摆
                 state.forecast[code] = await asyncio.to_thread(
-                    forecast_one, code, p["name"], mm, dd)
+                    forecast_one, code, p["name"], mm, dd, APP_HORIZONS)
+                # 预测历史落库（七档），供命中率统计；并定期清理 90 天前日志
+                _log_forecast(code, state.forecast[code])
+                store.truncate_forecast_log(int(time.time() * 1000)
+                                           - 90 * 86400_000)
             state.last_kline_ts = time.time()
             state.last_forecast_ts = state.last_kline_ts
         except asyncio.CancelledError:

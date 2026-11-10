@@ -13,7 +13,7 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import collector, store
+from . import autofill, collector, llm, store
 from . import db_sync
 from .config import (APP_HORIZONS, HORIZONS, MULTI_PERIODS, PRODUCTS,
                      PRODUCT_BY_CODE, STATIC_DIR)
@@ -36,6 +36,11 @@ _ws_connections = 0
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.init()
+    # 启动自检补全：依据期货交易日历检测缺口并补齐窗口内缺失（不阻塞服务启动）
+    try:
+        await autofill.check_and_fill()
+    except Exception:  # noqa: BLE001
+        log.exception("启动自检补全失败（不影响服务启动）")
     task = asyncio.create_task(collector.run_all())
     log.info("collectors started")
     try:
@@ -62,6 +67,7 @@ async def health():
         "ts": datetime.now(timezone.utc).isoformat(),
         "products": [p["code"] for p in PRODUCTS],
         "meta": collector.state.snapshot_meta(),
+        "autofill": autofill.get_report(),
     }
 
 
@@ -81,7 +87,7 @@ async def products():
             "daily_bars": store.daily_count(code),
         })
     return {"products": out, "horizons": [
-        {"key": k, "label": l, "minutes": m} for k, l, m, _, _ in HORIZONS]}
+        {"key": k, "label": l, "minutes": m} for k, l, m, _, _ in APP_HORIZONS]}
 
 
 @app.get("/api/quote")
@@ -478,6 +484,91 @@ async def sync_repair():
         }
     except Exception as e:  # noqa: BLE001
         return _fail(e, "sync/repair")
+
+
+# =====================================================================
+#  启动自检补全 / 命中率历史 / 大模型（新增）
+# =====================================================================
+
+@app.get("/api/autofill/status")
+async def autofill_status():
+    return autofill.get_report()
+
+
+@app.post("/api/autofill/run")
+async def autofill_run():
+    try:
+        return await autofill.check_and_fill()
+    except Exception as e:  # noqa: BLE001
+        return _fail(e, "autofill/run")
+
+
+def _history_for_code(code: str, since_ms: int) -> list[dict]:
+    rows = []
+    for key, label, minutes, _, _ in APP_HORIZONS:
+        logs = store.forecast_log_since(code, key, since_ms)
+        total = hits = 0
+        for lg in logs:
+            pred = lg["dir"]
+            if pred == 0 or lg["price"] is None:
+                continue
+            actual = store.price_at_or_after(code, lg["ts"] + minutes * 60_000)
+            if actual is None:
+                continue
+            act_dir = 1 if actual > lg["price"] else (-1 if actual < lg["price"] else 0)
+            if act_dir == 0:
+                continue
+            total += 1
+            if act_dir == pred:
+                hits += 1
+        rows.append({
+            "key": key, "label": label, "minutes": minutes,
+            "total": total, "hits": hits,
+            "accuracy": round(hits / total, 4) if total else None,
+        })
+    return rows
+
+
+@app.get("/api/history")
+async def history(code: str = Query("AL"),
+                  days: int = Query(30, ge=1, le=365)):
+    if code != "ALL" and code not in PRODUCT_BY_CODE:
+        return _unknown()
+    since = int(time.time() * 1000) - days * 86_400_000
+    if code == "ALL":
+        return {"code": "ALL", "days": days,
+                "per_product": {c: _history_for_code(c, since)
+                                for c in PRODUCT_BY_CODE}}
+    return {"code": code, "days": days, "horizons": _history_for_code(code, since)}
+
+
+@app.get("/api/llm/config")
+async def llm_config_get():
+    return llm.get_config()
+
+
+@app.post("/api/llm/config")
+async def llm_config_post(payload: dict):
+    try:
+        base = str(payload.get("base", "") or "")
+        model = str(payload.get("model", "") or "")
+        key = payload.get("key")
+        key = str(key) if isinstance(key, str) else None
+        return llm.set_config(base, model, key)
+    except Exception as e:  # noqa: BLE001
+        return _fail(e, "llm/config")
+
+
+@app.post("/api/llm/analyze")
+async def llm_analyze(payload: dict):
+    try:
+        code = payload.get("code", "AL")
+        if code not in PRODUCT_BY_CODE:
+            return _unknown()
+        period = payload.get("period", "1m")
+        return await llm.analyze(code, period)
+    except Exception as e:  # noqa: BLE001
+        return _fail(e, "llm/analyze")
 
 
 def _origin_allowed(origin: str | None) -> bool:

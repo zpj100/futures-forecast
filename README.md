@@ -34,11 +34,11 @@ App 端**完全独立运行**：直连新浪公开行情，把秒级快照、分
 # 安装依赖
 pip install --break-system-packages -r backend/requirements.txt
 
-# 启动（默认 8000 端口）
+# 启动（默认 8123 端口）
 bash run.sh
 ```
 
-打开 <http://localhost:8000> 即为仪表盘，`/docs` 为自动生成的接口文档。
+打开 <http://localhost:8123> 即为仪表盘，`/docs` 为自动生成的接口文档。
 
 ## 三、数据来源与粒度（重要）
 
@@ -289,7 +289,7 @@ bash android/build-apk.sh
 | 同步与预测 | 各周期统一源站 ts 口径（此前源站「段末」与本地「自然桶起点」双轨导致永远补不齐）；回补按品种×周期每批 ≤300 根自动连续、失败批存 `sync_pending` 下次续跑、幂等；日线体检改 180 天、只写真正缺失的 ts；sigma 归一化修复、伦铝 4h/8h 标「不适用」、4h/8h 桶按 CST 夜盘 21:00 对齐 |
 | 前端 | 手动预测状态不再冻结、`pull()` 回填时序修正、5 秒轮询改为数据签名变化才重绘（事件委托）、命中率实时刷新 |
 | 服务端全对齐 | 新增 `/api/app/state`、`/api/app/snapshot`、`/api/app/kline`（8 周期、ts 毫秒）、`/api/app/forecast`（7 档）、`/api/sync/check`、`/api/sync/repair`（分批幂等）；`kline_multi` 多周期真实落库；既有 REST/WS/`docs` 契约不变 |
-| 对照开关 | 设置页「服务端对照」：地址默认 `http://127.0.0.1:8000`，开关 + 测试连接；开启后单次 `serverGet('/api/app/snapshot?...')` 取数并复用现有渲染，显示本地/服务端报价、K 线根数、预测方向差异；5 秒超时、失败 30 秒冷却并自动回退本地 |
+| 对照开关 | 设置页「服务端对照」：地址默认 `http://127.0.0.1:8123`，开关 + 测试连接；开启后单次 `serverGet('/api/app/snapshot?...')` 取数并复用现有渲染，显示本地/服务端报价、K 线根数、预测方向差异；5 秒超时、失败 30 秒冷却并自动回退本地 |
 
 ### 服务端本地部署（WSL Debian）
 
@@ -297,10 +297,10 @@ bash android/build-apk.sh
 cd ~/projects/futures-forecast
 python3 -m venv backend/.venv
 backend/.venv/bin/pip install -r backend/requirements.txt
-bash run.sh                      # 默认 http://127.0.0.1:8000，/docs 为接口文档
+bash run.sh                      # 默认 http://127.0.0.1:8123，/docs 为接口文档
 ```
 
-Windows 侧经 WSL2 localhostForwarding 可直接访问 `http://127.0.0.1:8000`。
+Windows 侧经 WSL2 localhostForwarding 可直接访问 `http://127.0.0.1:8123`。
 需要局域网访问时显式 `FF_HOST=0.0.0.0 bash run.sh`（生产请加反向代理与认证）。
 
 ### 分批补全的能力边界（实测源站）
@@ -317,12 +317,23 @@ Windows 侧经 WSL2 localhostForwarding 可直接访问 `http://127.0.0.1:8000`�
    - 回补基准改为**源站整段序列**（`buildBatches` 收集 `j.bars` 全部中本地没有的 ts），5m/15m/30m/60m 补到源站可给最长历史，1d 回溯 180 天，1m 仍 1023 根上限。
    - 首次启动**自动迁移**：`Engine.start()` 后台调用 `Store.migrateLegacyBars()`，对照 `assets/seed.db` 删除 5m/15m/30m/60m 的旧口径残留行（键 `db_migrated_260` 保证只跑一次）。
    - 设置页新增「诊断」与「重建本地数据库」按钮兜底。
-2. **WSL 服务端启动与手机可达**：提供 `run-lan.sh`（内部 `FF_HOST=0.0.0.0` 监听），配合 Windows 侧 `netsh interface portproxy` + 防火墙放行 8000；手机填 `http://<电脑局域网IP>:8000` 即可（详见 `docs/11_手机数据库同步与修复.md`）。
+2. **WSL 服务端启动与手机可达**：提供 `run-lan.sh`（内部 `FF_HOST=0.0.0.0` 监听），配合 Windows 侧 `netsh interface portproxy` + 防火墙放行 8123；手机填 `http://<电脑局域网IP>:8123` 即可（详见 `docs/11_手机数据库同步与修复.md`）。
 3. **手机↔服务端数据库双向同步**：服务端新增 `/api/db/{status,export,import}`（独立分表 `kline_app`，不影响既有接口）；App 设置页新增「数据库同步」区块，双向增量、分批 ≤300 根、失败批续跑、幂等，含进度条与本地/服务端对照。
 
 ### 版本号
 `versionCode = 260`（`versionName 2.6.0`），签名 SHA-1 `745a9a43…` 与 v2.5.0 一致，可直接覆盖安装且本地数据保留。
 
-## 十一、免责声明
+## 十一、v2.7.0：服务端化与启动自检（端口 8123）
+
+### 解决的四件事
+1. **服务端成为唯一真源**：把 App 核心能力（行情/预测/历史/设置）搬至 Web 前端 `backend/app/static`（四 tab 全覆盖），Android 端保留为独立 App 并默认指向 `8123`；后端时间序列统一毫秒整数、自然时间桶口径。详见 `docs/12_服务端化与启动自检.md`。
+2. **启动自检补全**：新增交易日历 `backend/app/calendar.py`（日盘 9:00–15:00 含休市子窗口、夜盘 21:00–次日 01:00 跨午夜、跳过周末）与 `backend/app/autofill.py`，服务启动时按交易日历逐段比对 1m 覆盖率，窗口内缺失自动回补、窗口外（Sina 1m 固定 1023 根物理不可补）如实标注，且不阻塞 API 启动。
+3. **服务端大模型**：新增 `/api/llm/config`（GET/POST，密钥存 `DATA_DIR/llm.json` 并 `chmod 600`，绝不入仓/库）与 `/api/llm/analyze`，复用七档预测生成趋势研判。
+4. **预测命中率历史**：`collector` 每轮把七档预测落库 `forecast_log`（主键幂等），新增 `/api/history` 按 horizon 统计命中率（对应周期到期后有实际价可比对，短周期数分钟内即可出数）。
+
+### 版本号
+`versionCode = 270`（`versionName 2.7.0`），签名 SHA-1 `745a9a43…` 与 v2.6.0 一致，可直接覆盖安装且本地数据保留。
+
+## 十二、免责声明
 
 本项目为量化统计研究与可视化演示，所有预测与建议均不构成投资建议。期货交易有杠杆风险，请自行判断并控制仓位。

@@ -1,6 +1,6 @@
 # 接口文档
 
-服务默认监听 `http://localhost:8000`，`/docs` 提供自动生成的 OpenAPI 交互文档。
+服务默认监听 `http://localhost:8123`，`/docs` 提供自动生成的 OpenAPI 交互文档。
 所有接口返回 JSON（UTF-8），WebSocket 每 3 秒推送一次。
 
 ## 通用说明

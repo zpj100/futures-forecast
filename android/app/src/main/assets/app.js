@@ -27,7 +27,7 @@
     lastSig: null,       // 上次渲染的「数据 + 视图」签名，5 秒定时拉取无变化时跳过重建
     // 服务端对照开关：on/base 持久化到 localStorage，snap 为最近一次成功快照
     server: {
-      on: false, base: 'http://127.0.0.1:8000', snap: null,
+      on: false, base: 'http://127.0.0.1:8123', snap: null,
       bars: [], snapCode: '', snapPeriod: '', lastBarTs: 0,
       ts: 0, version: '', compareText: '', failUntil: 0
     },
@@ -35,8 +35,8 @@
     db: {
       busy: false,
       base: (function () {
-        try { return localStorage.getItem('ff_db_base') || 'http://127.0.0.1:8000'; }
-        catch (e) { return 'http://127.0.0.1:8000'; }
+        try { return localStorage.getItem('ff_db_base') || 'http://127.0.0.1:8123'; }
+        catch (e) { return 'http://127.0.0.1:8123'; }
       })(),
       failedBatches: 0,
       warns: []
@@ -1136,8 +1136,8 @@
   var DB_LIMIT = 300;
   var DB_MAX_BATCH = 30;
   var DB_HINT = '请确认：① 服务端以 0.0.0.0 启动；② Windows 已配置端口转发（netsh interface portproxy）；'
-    + '③ 手机与电脑在同一局域网；④ 地址填 http://<电脑局域网IP>:8000'
-    + '（WSL 本机或预览用 http://127.0.0.1:8000）。';
+    + '③ 手机与电脑在同一局域网；④ 地址填 http://<电脑局域网IP>:8123'
+    + '（WSL 本机或预览用 http://127.0.0.1:8123）。';
 
   /** 把 Native 抛出的异常/错误串转成可操作提示（地址非法 / 超时 / 拒绝连接）。 */
   function dbHint(e) {
@@ -1150,7 +1150,7 @@
       return m + '（无法连接：' + DB_HINT + '）';
     }
     if (/invalid|illegal|not allowed|非法|地址|scheme/.test(low)) {
-      return m + '（地址非法：需为 http://<私有网段IP>:8000 或 http://127.0.0.1:8000）';
+      return m + '（地址非法：需为 http://<私有网段IP>:8123 或 http://127.0.0.1:8123）';
     }
     return m;
   }

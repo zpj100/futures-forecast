@@ -10,4 +10,4 @@ else
 fi
 
 exec "$PY" -m uvicorn app.main:app \
-    --host "${FF_HOST:-127.0.0.1}" --port "${PORT:-8000}"
+    --host "${FF_HOST:-127.0.0.1}" --port "${PORT:-8123}"
