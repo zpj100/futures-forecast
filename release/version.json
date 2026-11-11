@@ -1,7 +1,7 @@
 {
-  "version": "2.9.0",
-  "versionCode": 290,
+  "version": "2.9.1",
+  "versionCode": 291,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.9.0：放开安卓 App 连接公网 HTTP 服务器白名单，使手机可直连公网服务端（180.76.238.232:8123）做数据库同步。仅显式放行该固定公网 IP 走明文 HTTP，其余公网 http 仍被拒绝；loopback / 私有网段 / https 规则不变。服务端 /api/db/*（status/export/sync3d/import）此前已具备手机双向同步能力，本次仅为客户端可达性解锁。"
+  "notes": "v2.9.1：修复手机端数据库同步「只补近 3 天、老数据全断点」的问题。1m+ 下行改为从服务端全量分页拉取（since=0 一路翻页，复用 /api/db/export），以服务端权威连续序列幂等覆盖本地，彻底消除老于 3 天的历史断点；内盘 AL/AO 原生 5m/15m/30m/60m 含数周~数月连续历史，1m 与外盘 AHD 受源站上限约 2.8 天。1s/30s 仍维持本机实时采集真源、tail-only。服务端 db_sync.py 同步修正过期注释。"
 }

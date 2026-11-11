@@ -1378,28 +1378,44 @@
           return;
         }
 
-        // 分钟级及以上（1m/5m/15m/30m/60m/1d）：走 /api/db/sync3d，
-        // 以服务端权威序列为准，一次性拉取「最近 3 天」完整切片幂等补缺，
-        // 覆盖/补齐手机本地中间缺失点（不再只拉尾部，根治中间数据点缺失）。
-        // importBars 单次上限 300 根，超量按 300 切片分批写入。
-        var p3 = '/api/db/sync3d?code=' + encodeURIComponent(c.code)
-          + '&period=' + encodeURIComponent(c.period);
-        var r3 = dbGet(p3);
-        if (r3.__err) { dbWarn(lb + ' 失败：' + r3.__err); nextCombo(); advance(); return; }
-        var bars3 = r3.bars || [];
-        if (bars3.length) {
-          var CH = 300, bi = 0, bnum = 0;
-          while (bi < bars3.length) {
-            var chunk = bars3.slice(bi, bi + CH);
-            var added3 = dbImport(c.code, c.period, chunk);
-            if (added3 === -1) {
-              dbWarn(lb + ' importBars 返回失败（第 ' + (bnum + 1) + ' 批）');
-              break;
+        // 分钟级及以上（1m/5m/15m/30m/60m/1d）：以服务端权威序列为准，
+        // 全量分页拉取（since=0 → 翻页直到 has_more 为 false）并幂等补缺，
+        // 彻底消除「老于 3 天」的历史断点。服务端内盘原生 5m/15m/30m/60m
+        // 含数周~数月的连续历史，外盘 AHD 与 1m 受源站上限约 2.8 天。
+        // 1s/30s 仍是本机实时采集真源，维持 tail-only（见上方分支）。
+        // importBars 单次上限 300 根：每页内部再按 300 切片写入。
+        var since = 0, pages = 0;
+        while (true) {
+          var pPath = '/api/db/export?code=' + encodeURIComponent(c.code)
+            + '&period=' + encodeURIComponent(c.period)
+            + '&since=' + since + '&limit=' + DB_LIMIT;
+          var rr = dbGet(pPath);
+          if (rr.__err) { dbWarn(lb + ' 失败：' + rr.__err); break; }
+          var rbars = rr.bars || [];
+          if (rbars.length) {
+            var CH = 300, bi = 0;
+            while (bi < rbars.length) {
+              var chunk = rbars.slice(bi, bi + CH);
+              var added = dbImport(c.code, c.period, chunk);
+              if (added === -1) {
+                dbWarn(lb + ' importBars 返回失败（第 ' + (pages + 1) + ' 页）');
+                break;
+              }
+              stat.down += chunk.length;
+              if (added > 0) stat.net += added;
+              bi += CH;
             }
-            stat.down += chunk.length;
-            if (added3 > 0) stat.net += added3;
-            bi += CH; bnum++;
           }
+          pages++;
+          c.page = pages;
+          var nns = Number(rr.next_since);
+          var more = !!rr.has_more && isFinite(nns) && nns > since;
+          if (!more) {
+            if (rr.has_more) dbWarn(lb + ' 分页游标未前进，提前结束该组合');
+            break;
+          }
+          since = nns;
+          if (pages > 200) { dbWarn(lb + ' 达到 200 页上限，提前结束该组合'); break; }
         }
         nextCombo();
         advance();

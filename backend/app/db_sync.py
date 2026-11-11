@@ -2,9 +2,13 @@
 
 契约（与 Android / 前端组严格一致）：
 - 所有 ts 统一 UTC 毫秒整数。
-- export 的 5m/15m/30m/60m 只读手机上传的 kline_app 分表（源站段末口径），
-  服务端自身 kline_multi 是自然桶聚合口径，绝不导出给手机以免污染。
+- export 的 5m/15m/30m/60m 取数优先级：① 服务端权威原生多周期 kline_native
+  （内盘 AL/AO 直采，不经 1m 聚合，含数周~数月连续历史）；② 回退聚合表
+  kline_multi（外盘 AHD / 历史）；③ 再回退手机上传的 kline_app 分表。手机同步
+  时以此 authoritative 序列为准，避免把缺口反向污染回手机。
 - import 一律写 kline_app，不碰 kline_min/kline_day/kline_multi（既有接口零影响）。
+- sync3d 仅返回最近 3 天切片（前端/轻量补缺用）；手机 1m+ 全量补齐应改用
+  export 分页（since=0 一路翻页），不要依赖 sync3d 的 3 天窗口。
 """
 from __future__ import annotations
 
