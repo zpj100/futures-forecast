@@ -56,9 +56,55 @@ async function loadForecast() {
   renderIndicators();
 }
 
+const TICK_PERIODS = { '1s': 0, '30s': 30 };
+
 async function loadKline(code, period) {
-  const d = await getJSON(`/api/kline/${code}?period=${period}&limit=400`);
-  state.bars = d.bars || [];
+  if (period in TICK_PERIODS) {
+    const d = await getJSON(`/api/ticks/${code}?bucket=${TICK_PERIODS[period]}&limit=600`);
+    state.bars = d.bars || [];
+  } else {
+    const d = await getJSON(`/api/kline/${code}?period=${period}&limit=400`);
+    state.bars = d.bars || [];
+  }
+  drawChart();
+}
+
+function fmtTs(ts) {
+  if (ts === null || ts === undefined) return '';
+  if (typeof ts === 'number') {
+    // Market timestamps are Beijing time; format with a fixed +8 offset so the
+    // label matches the K-line strings regardless of the viewer's timezone.
+    const d = new Date((ts + 8 * 3600) * 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+  }
+  // K-line timestamps arrive as "YYYY-MM-DD HH:MM:SS" (Beijing time);
+  // trim to "MM-DD HH:MM:SS" so both sources share one label format.
+  return String(ts).replace(/^\d{4}-/, '');
+}
+
+// Append the newest quote to the in-memory tick series so the curve moves
+// with the 3s WebSocket push instead of waiting for a refetch.
+// serverTs is the push timestamp from the backend, used instead of the local
+// clock so a skewed client clock cannot shift points off the axis.
+function appendTick(q, serverTs) {
+  if (!q || q.last == null) return;
+  const bucket = TICK_PERIODS[state.activePeriod];
+  const parsed = serverTs ? Date.parse(serverTs) : NaN;
+  const now = Math.floor((Number.isNaN(parsed) ? Date.now() : parsed) / 1000);
+  const ts = bucket > 0 ? Math.floor(now / bucket) * bucket : now;
+  const bars = state.bars;
+  const tail = bars[bars.length - 1];
+  if (tail && tail.ts === ts) {
+    tail.c = q.last;
+    tail.h = Math.max(tail.h ?? q.last, q.last);
+    tail.l = Math.min(tail.l ?? q.last, q.last);
+  } else if (tail && tail.ts > ts) {
+    return;
+  } else {
+    bars.push({ ts, o: q.last, h: q.last, l: q.last, c: q.last, n: 1 });
+    if (bars.length > 600) bars.shift();
+  }
   drawChart();
 }
 
@@ -222,8 +268,8 @@ function drawChart() {
   ctx.textBaseline = 'top';
   for (let k = 0; k < xCount; k++) {
     const idx = Math.round((k / Math.max(xCount - 1, 1)) * (bars.length - 1));
-    const ts = bars[idx].ts || '';
-    const label = ts.length >= 16 ? ts.slice(5, 16) : ts;
+    const raw = fmtTs(bars[idx].ts);
+    const label = raw.length >= 16 ? raw.slice(0, 16) : raw;
     const xx = x(idx);
     ctx.fillStyle = '#5f7085';
     ctx.fillText(label, Math.min(Math.max(xx, padL + 22), W - padR - 22), H - padB + 7);
@@ -281,7 +327,7 @@ function drawChart() {
 
   // range + legend
   $('#chartRange').textContent =
-    `${bars[0].ts || ''} → ${bars[bars.length - 1].ts || ''}　共 ${bars.length} 根`;
+    `${fmtTs(bars[0].ts)} → ${fmtTs(bars[bars.length - 1].ts)}　共 ${bars.length} 根`;
   $('#chartLegend').textContent = `收盘 ${fmt(closes[closes.length - 1], 2)}　区间 ${fmt(Math.min(...lows), 2)} ~ ${fmt(Math.max(...highs), 2)}`;
 }
 
@@ -436,6 +482,7 @@ function connectWS() {
     if (d.quotes) {
       state.quotes = d.quotes;
       renderQuoteCards();
+      if (state.activePeriod in TICK_PERIODS) appendTick(d.quotes[state.activeCode], d.ts);
     }
     if (d.forecast) {
       for (const [code, f] of Object.entries(d.forecast)) {
@@ -489,7 +536,7 @@ cv.addEventListener('mousemove', (e) => {
   const tip = $('#chartTip');
   tip.hidden = false;
   tip.innerHTML =
-    `<div>${b.ts || ''}</div>` +
+    `<div>${fmtTs(b.ts)}</div>` +
     `<div>开 ${fmt(b.o, 2)}　高 ${fmt(b.h, 2)}</div>` +
     `<div>低 ${fmt(b.l, 2)}　收 ${fmt(b.c, 2)}</div>` +
     `<div>量 ${fmt(b.v, 0)}</div>`;
@@ -517,6 +564,16 @@ async function boot() {
   tickClock();
   setInterval(tickClock, 1000);
   try {
+    const q = (location.search.match(/[?&]period=([0-9a-z]+)/) || [])[1];
+    if (q) {
+      const btn = document.querySelector(`#periodSeg button[data-period="${q}"]`);
+      if (btn) {
+        state.activePeriod = q;
+        for (const x of $('#periodSeg').children) x.classList.toggle('on', x === btn);
+      }
+    }
+  } catch (e) { /* ignore */ }
+  try {
     await loadProducts();
     await Promise.all([
       loadForecast(),
@@ -529,7 +586,18 @@ async function boot() {
   connectWS();
   setInterval(() => { loadForecast().catch(() => {}); }, 20000);
   setInterval(() => { loadProducts().catch(() => {}); }, 30000);
-  setInterval(() => { loadKline(state.activeCode, state.activePeriod).catch(() => {}); }, 60000);
+  setInterval(() => {
+    // Tick series already grows from the WebSocket push; this refetch only
+    // reconciles against the DB (drops/reshuffles missed samples).
+    if (state.activePeriod in TICK_PERIODS) {
+      loadKline(state.activeCode, state.activePeriod).catch(() => {});
+    }
+  }, 30000);
+  setInterval(() => {
+    if (!(state.activePeriod in TICK_PERIODS)) {
+      loadKline(state.activeCode, state.activePeriod).catch(() => {});
+    }
+  }, 60000);
   setInterval(() => { loadNews(state.newsCode).catch(() => {}); }, 120000);
 }
 

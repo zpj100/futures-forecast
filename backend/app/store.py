@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
-from .config import DB_PATH
+from .config import DB_PATH, SNAPSHOT_INTERVAL
 
 # Market timestamps from Sina are Beijing time.
 CST = timezone(timedelta(hours=8))
@@ -108,6 +108,55 @@ def snapshot_count(code: str) -> int:
         c = _connect()
         n = c.execute("SELECT COUNT(*) FROM snapshots WHERE code=?", (code,)).fetchone()[0]
     return int(n)
+
+
+def tick_series(code: str, bucket: int = 0, limit: int = 600) -> list[dict]:
+    """Aggregate the snapshot archive into a price series for the chart.
+
+    bucket <= 0 returns raw capture points (one per snapshot); bucket > 0
+    groups them into fixed time buckets and emits OHLC. Timestamps are epoch
+    seconds truncated to the bucket start so the x-axis stays stable between
+    refreshes. Only local captures exist here: public APIs expose no
+    second-level history, so this series grows with service uptime.
+    """
+    max_pts = max(2, min(int(limit), 5000))
+    step = int(bucket)
+    # How many raw rows a full window needs: one capture per SNAPSHOT_INTERVAL
+    # second at worst, so ceil(step / interval) rows per bucket.
+    per_bucket = max(1, -(-step // max(1, SNAPSHOT_INTERVAL))) if step > 0 else 1
+    rows_needed = min(max_pts * per_bucket + per_bucket, 200000)
+    with _lock:
+        c = _connect()
+        rows = c.execute(
+            "SELECT ts,last FROM (SELECT ts,last FROM snapshots WHERE code=?"
+            " ORDER BY ts DESC LIMIT ?) ORDER BY ts ASC",
+            (code, rows_needed),
+        ).fetchall()
+
+    if step <= 0:
+        return [{"ts": int(r["ts"]), "o": r["last"], "h": r["last"],
+                 "l": r["last"], "c": r["last"], "n": 1}
+                for r in rows if r["last"] is not None]
+
+    out: list[dict] = []
+    cur = None
+    for r in rows:
+        if r["last"] is None:
+            continue
+        b = (int(r["ts"]) // step) * step
+        if cur is None or cur["ts"] != b:
+            if cur is not None:
+                out.append(cur)
+            cur = {"ts": b, "o": r["last"], "h": r["last"],
+                   "l": r["last"], "c": r["last"], "n": 1}
+        else:
+            cur["h"] = max(cur["h"], r["last"])
+            cur["l"] = min(cur["l"], r["last"])
+            cur["c"] = r["last"]
+            cur["n"] += 1
+    if cur is not None:
+        out.append(cur)
+    return out[-max_pts:]
 
 
 # ------------------------------------------------------------------ klines

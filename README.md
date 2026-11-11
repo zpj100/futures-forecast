@@ -75,6 +75,7 @@ bash run.sh
 | GET | `/api/quote` | 最新报价 |
 | GET | `/api/kline/{code}` | `code`=AL/AO/AHD，`period`=1m/5m/15m/30m/60m/1d |
 | GET | `/api/snapshots/{code}` | 秒级快照历史 |
+| GET | `/api/ticks/{code}` | 秒级曲线，`bucket`=0 原始点 / >0 按秒聚合 OHLC |
 | GET | `/api/forecast` | 全部预测；加 `?code=AL` 取单品种 |
 | GET | `/api/analysis` | 三品种量化汇总 |
 | GET | `/api/news` | 资讯，可加 `?code=AL` 过滤 |

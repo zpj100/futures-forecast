@@ -114,6 +114,23 @@ async def snapshots(code: str, limit: int = Query(900, ge=10, le=5000)):
     return {"code": code, "points": store.snapshot_range(code, limit)}
 
 
+@app.get("/api/ticks/{code}")
+async def ticks(code: str,
+                bucket: int = Query(0, ge=0, le=3600),
+                limit: int = Query(600, ge=10, le=5000)):
+    """Price series built from the locally accumulated snapshot archive.
+
+    bucket=0 gives raw capture points (one per 3s snapshot); bucket>0 gives
+    OHLC bars over that many seconds. This is the only second-level source:
+    public APIs expose no second-level history, so the series starts when the
+    service first ran.
+    """
+    if code not in PRODUCT_BY_CODE:
+        return JSONResponse({"error": "unknown code"}, status_code=404)
+    return {"code": code, "bucket": bucket,
+            "bars": store.tick_series(code, bucket, limit)}
+
+
 @app.get("/api/forecast")
 async def forecast(code: str | None = None):
     if code:
