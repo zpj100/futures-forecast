@@ -1,7 +1,7 @@
 {
-  "version": "2.8.0",
-  "versionCode": 280,
+  "version": "2.9.0",
+  "versionCode": 290,
   "url": "https://gitee.com/zpj100/futures-forecast/releases",
   "mirror": "https://gitee.com/zpj100/futures-forecast/releases",
-  "notes": "v2.8.0：分钟级曲线贴右边缘 + 原生多周期根治预测「数据不足」+ 同步近 3 天补缺。① 曲线贴右边缘（网页端 + Android 三品种对比）：分钟级以上（1m/5m/15m/30m/60m/1d）把最后已知价平铺延伸到「现在」，曲线右边缘不再比现价慢一拍；1s/30s 实时采集点维持原补尾逻辑。② 固定「近 3 天」比对窗口：仅 1m+ 做全量比对，1s/30s 仍只拉尾部，只补充缺失部分。③ 原生多周期落库（根治）：后端对三品种内盘（AL/AO）用 Sina 原生 5/15/30/60m 接口直采入库 kline_native，预测 5m/15m/30m 改用原生序列、彻底告别「样本不足」（外盘 AHD 4h 无原生源，如实保留「数据不足」）。④ 网页端预测页新增「刷新预测」按钮（POST /api/forecast/refresh，复用服务端最新序列重算七档并落库预测日志）。⑤ Android 数据下载同步：1m+ 走新增 GET /api/db/sync3d 取服务端权威「近 3 天」完整切片幂等补缺，根治手机 SQLite 中间数据点缺失；1s/30s 维持 tail-only（手机本机采集为真源）。"
+  "notes": "v2.9.0：放开安卓 App 连接公网 HTTP 服务器白名单，使手机可直连公网服务端（180.76.238.232:8123）做数据库同步。仅显式放行该固定公网 IP 走明文 HTTP，其余公网 http 仍被拒绝；loopback / 私有网段 / https 规则不变。服务端 /api/db/*（status/export/sync3d/import）此前已具备手机双向同步能力，本次仅为客户端可达性解锁。"
 }

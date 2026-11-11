@@ -842,7 +842,9 @@ public class Bridge {
                 boolean loopback = h.equals("127.0.0.1") || h.equals("localhost")
                         || h.endsWith(".localhost");
                 boolean priv = isPrivateIPv4(h);
-                if (!loopback && !priv) return false;   // 拒绝公网 http
+                // 显式放行的公网 HTTP 主机：手机直连公网服务器做数据库同步（明文，仅限已知固定 IP）
+                boolean allowedPublic = h.equals("180.76.238.232");
+                if (!loopback && !priv && !allowedPublic) return false;   // 拒绝其余公网 http
                 if (port <= 0 || port > 65535) return false;   // 必须显式 PORT
                 return true;
             }
