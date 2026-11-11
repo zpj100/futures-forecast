@@ -600,19 +600,28 @@ async def llm_analyze(payload: dict):
         return _fail(e, "llm/analyze")
 
 
-def _origin_allowed(origin: str | None) -> bool:
-    """允许无 Origin（本机脚本/websockets 客户端）或指向本机的 Origin。"""
+def _origin_allowed(origin: str | None, host: str | None = None) -> bool:
+    """允许无 Origin（本机脚本/websockets 客户端）、指向本机的 Origin，
+    或与本次请求 Host 头同主机的 Origin（支持通过公网/LAN IP/域名访问页面时建立 WS）。"""
     if not origin:
         return True
-    host = (urlparse(origin).hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "::1", "[::1]")
+    origin_host = (urlparse(origin).hostname or "").lower()
+    if origin_host in ("localhost", "127.0.0.1", "::1", "[::1]"):
+        return True
+    # 允许 Origin 主机与请求 Host 主机一致：公网 IP / 局域网 IP / 反向代理域名均放开
+    if host:
+        host_host = host.split(":")[0].lower()
+        if origin_host and origin_host == host_host:
+            return True
+    return False
 
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     global _ws_connections
     origin = ws.headers.get("origin")
-    if not _origin_allowed(origin):
+    req_host = ws.headers.get("host")
+    if not _origin_allowed(origin, req_host):
         log.warning("ws 拒绝非本机 Origin: %s", origin)
         await ws.close(code=1008)
         return
