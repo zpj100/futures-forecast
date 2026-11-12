@@ -415,6 +415,38 @@ function dirClass(d) {
   return 'na';
 }
 
+function periodBoundary(minutes) {
+  // 下一个周期边界（毫秒），用于「按本身周期自动刷新」倒计时
+  const ms = Math.max(1, minutes) * 60000;
+  return Math.ceil(Date.now() / ms) * ms;
+}
+
+function fcRefreshText(label, next) {
+  const secs = Math.max(0, Math.round((next - Date.now()) / 1000));
+  return '↻ 每' + label + '自动刷新 · ' + secs + 's';
+}
+
+function fcCountdownTick() {
+  if (state.activeTab !== 'forecast') return;
+  const now = Date.now();
+  let minNext = Infinity;
+  document.querySelectorAll('#horizons .hz-refresh').forEach((ex) => {
+    let next = Number(ex.dataset.next);
+    if (!(next > now)) {
+      next = periodBoundary(Number(ex.dataset.period));
+      ex.dataset.next = String(next);
+    }
+    ex.textContent = fcRefreshText(ex.dataset.label, next);
+    if (next < minNext) minNext = next;
+  });
+  if (minNext <= now) {
+    // 某周期边界到达：触发一次预测刷新（后端每 60s 也在重算，这里做可见的周期对齐刷新）
+    const one = document.querySelector('#horizons .hz-refresh[data-period="1"]');
+    if (one) one.dataset.next = String(periodBoundary(1)); // 防抖：先把 1 分钟推到下一边界
+    loadForecast().catch(() => {});
+  }
+}
+
 function renderHorizons() {
   const wrap = $('#horizons');
   wrap.textContent = '';
@@ -443,6 +475,12 @@ function renderHorizons() {
     sub.append(el('span', '', '目标 ' + fmt(h.target_price, 2)));
     box.append(sub);
     if (h.note) box.append(el('div', 'hz-note', h.note));
+    const rf = el('div', 'hz-refresh muted sm');
+    rf.dataset.period = String(h.minutes);
+    rf.dataset.label = h.label;
+    rf.dataset.next = String(periodBoundary(h.minutes));
+    rf.textContent = fcRefreshText(h.label, Number(rf.dataset.next));
+    box.append(rf);
     wrap.append(box);
   }
 }
@@ -786,6 +824,7 @@ async function boot() {
 
   tickClock();
   setInterval(tickClock, 1000);
+  setInterval(fcCountdownTick, 1000);
   try {
     await loadProducts();
     await Promise.all([
