@@ -100,13 +100,18 @@ def _report(context: str, exc: BaseException) -> None:
 
 
 def _log_forecast(code: str, fc: dict) -> None:
-    """把七档预测快照幂等写入 forecast_log，供 /api/history 命中率统计。"""
+    """把七档预测快照幂等写入 forecast_log，供 /api/history 命中率统计。
+    入场价取顶层 price（各档共享同一时点入场价，命中率据此判定后续实际涨跌）；
+    score 取综合评分。注意 horizon 字典本身不含 price/score，必须用顶层值，
+    否则 price=None 会被命中率统计整行跳过，导致页面恒显「样本不足」。"""
     if not fc or "horizons" not in fc:
         return
     ts = int(time.time() * 1000)
+    entry_price = fc.get("price")
+    overall_score = fc.get("score")
     for h in fc["horizons"]:
         store.log_forecast(code, ts, h.get("key"), h.get("minutes", 0),
-                          h.get("direction"), h.get("score"), h.get("price"))
+                          h.get("direction"), overall_score, entry_price)
 
 
 async def tick_snapshots() -> None:
