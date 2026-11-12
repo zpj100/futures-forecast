@@ -165,6 +165,10 @@ main{
 .hz-note{
   font-size:10px;color:var(--warn);opacity:.9;line-height:1.35;
 }
+.hz-refresh{
+  margin-top:2px;font-size:10px;color:var(--fg-mute);font-family:var(--mono);
+  font-variant-numeric:tabular-nums;letter-spacing:.3px;
+}
 
 /* ------------------------------------------------------------------- duo */
 .duo{display:grid;grid-template-columns:1fr 1fr;gap:16px}
